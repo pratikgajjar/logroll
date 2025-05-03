@@ -6,3 +6,6 @@
 5. Use logfmt format for logging key=value pairs.
 6. Use latest version of rust and cargo and libraries. 
 7. Handle graceful shutdowns.
+8. This may become complex project so divide it into multiple modules as per SOLID principles.
+9. Use tokio for async runtime.
+10. Use pgoutput as replication plugin.
