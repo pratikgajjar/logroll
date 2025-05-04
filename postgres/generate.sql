@@ -1,0 +1,113 @@
+-- Data generation script for postgres_data_types table
+
+BEGIN;
+
+-- Ensure required extension for UUID
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Configure number of rows to generate
+WITH config AS (
+    SELECT 10 AS row_count  -- change to desired N
+), series AS (
+    SELECT generate_series(1, (SELECT row_count FROM config)) AS i
+)
+INSERT INTO postgres_data_types (
+    type_name,
+    smallint_val, integer_val, bigint_val,
+    decimal_val, numeric_val, real_val, double_precision_val,
+    money_val,
+    char_val, varchar_val, text_val,
+    bytea_val,
+    timestamp_val, timestamptz_val, date_val, time_val, timetz_val, interval_val,
+    boolean_val,
+    enum_mood_val,
+    point_val, line_val, lseg_val, box_val, path_val, polygon_val, circle_val,
+    cidr_val, inet_val, macaddr_val, macaddr8_val,
+    bit_val, varbit_val,
+    tsvector_val, tsquery_val,
+    uuid_val, xml_val,
+    json_val, jsonb_val, jsonpath_val,
+    integer_array_val, text_array_val, multidim_array_val,
+    composite_val,
+    int4range_val, int8range_val, numrange_val, tsrange_val, tstzrange_val, daterange_val,
+    int4multirange_val, int8multirange_val, nummultirange_val, tsmultirange_val, tstzmultirange_val, datemultirange_val,
+    domain_val,
+    oid_val, regclass_val, regproc_val, regprocedure_val, regoper_val, regoperator_val, regtype_val, regrole_val, regnamespace_val, regconfig_val, regdictionary_val,
+    pg_lsn_val,
+    xid8_val
+)
+SELECT
+    'type_' || i,
+    (i % 32768)::smallint,
+    i,
+    i * 10000000000,
+    (i * 1.23)::decimal(10,2),
+    (i * 1.23)::numeric(10,2),
+    (i * 1.23)::real,
+    (i * 1.234567)::double precision,
+    (i * 100.00)::money,
+    ('C' || lpad(i::text, 9, '0'))::char(10),
+    'V' || lpad(i::text, 9, '0'),
+    'text_' || i,
+    decode(lpad(to_hex(i), 8, '0'), 'hex'),
+    now()::timestamp,
+    now(),
+    CURRENT_DATE + (i || ' days')::interval,
+    CURRENT_TIME,
+    CURRENT_TIME,
+    (i || ' hours')::interval,
+    (i % 2 = 0),
+    CASE i % 3 WHEN 0 THEN 'happy' WHEN 1 THEN 'sad' ELSE 'neutral' END::mood_enum,
+    point(i, i),
+    line(point(i, i), point(i*2, i*2)),
+    lseg(point(i, i), point(i*2, i*2)),
+    box(point(i, i), point(i*2, i*2)),
+    format('[(%s,%s),(%s,%s)]', i, i, i*2, i*2)::path,
+    format('((%s,%s),(%s,%s))', i, i, i*2, i*2)::polygon,
+    circle(point(i, i), i),
+    ('192.168.'||(i%256)||'.0/24')::cidr,
+    ('192.168.1.'||(i%256))::inet,
+    ('08:00:2b:01:02:'||lpad(to_hex(i),2,'0'))::macaddr,
+    ('08:00:2b:01:02:03:04:'||lpad(to_hex(i),2,'0'))::macaddr8,
+    (i::bit(8)),
+    (i::bit(4) || i::bit(4))::varbit,
+    to_tsvector('english', 'text '||i),
+    to_tsquery('english', 'text & '||i),
+    gen_random_uuid(),
+    ('<root><i>'||i||'</i></root>')::xml,
+    json_build_object('i', i),
+    jsonb_build_object('i', i),
+    '$.i',
+    ARRAY[i, i*2, i*3],
+    ARRAY['a'||i, 'b'||i],
+    ARRAY[[i, i*2], [i*3, i*4]],
+    ROW(i, 'x'||i)::complex_type,
+    int4range(i, i*2),
+    int8range(i, i*2),
+    numrange(i, i*2),
+    tsrange(now()::timestamp, (now() + (i || ' minutes')::interval)::timestamp),
+    tstzrange(now(), now() + (i || ' minutes')::interval),
+    daterange(CURRENT_DATE, CURRENT_DATE + i),
+    format('{%s}', range_out(int4range(i, i*2)))::int4multirange,
+    format('{%s}', range_out(int8range(i, i*2)))::int8multirange,
+    format('{%s}', range_out(numrange(i, i*2)))::nummultirange,
+    format('{%s}', range_out(tsrange(now()::timestamp, (now() + (i || ' minutes')::interval)::timestamp)))::tsmultirange,
+    format('{%s}', range_out(tstzrange(now(), now() + (i || ' minutes')::interval)))::tstzmultirange,
+    format('{%s}', range_out(daterange(CURRENT_DATE, CURRENT_DATE + i)))::datemultirange,
+    i,
+    i,
+    'pg_type'::regclass,
+    NULL::regproc,
+    NULL::regprocedure,
+    NULL::regoper,
+    NULL::regoperator,
+    'integer'::regtype,
+    'postgres'::regrole,
+    'public'::regnamespace,
+    'english'::regconfig,
+    'simple'::regdictionary,
+    ('0/'||i::text)::pg_lsn,
+    (i + 100)::text::xid8
+FROM series;
+
+COMMIT;
