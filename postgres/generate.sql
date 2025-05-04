@@ -92,7 +92,7 @@ SELECT
     'pg_type'::regclass,
     'now'::regproc,
     'now()'::regprocedure,
-    to_regoper('+')::oid,
+    to_regoper('@?')::oid,
     to_regoperator('+ (integer, integer)')::oid,
     'integer'::regtype,
     'postgres'::regrole,
