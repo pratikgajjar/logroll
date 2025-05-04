@@ -1,11 +1,4 @@
 -- Data generation script for postgres_data_types table
-
-BEGIN;
-
--- Ensure required extension for UUID
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-
--- Configure number of rows to generate
 WITH config AS (
     SELECT 10 AS row_count  -- change to desired N
 ), series AS (
@@ -97,10 +90,10 @@ SELECT
     i,
     i,
     'pg_type'::regclass,
-    NULL::regproc,
-    NULL::regprocedure,
-    NULL::regoper,
-    NULL::regoperator,
+    'now'::regproc,
+    'now()'::regprocedure,
+    to_regoper('+')::oid,
+    to_regoperator('+ (integer, integer)')::oid,
     'integer'::regtype,
     'postgres'::regrole,
     'public'::regnamespace,
@@ -109,5 +102,3 @@ SELECT
     ('0/'||i::text)::pg_lsn,
     (i + 100)::text::xid8
 FROM series;
-
-COMMIT;
