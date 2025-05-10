@@ -974,17 +974,22 @@ dependencies = [
  "anyhow",
  "backoff",
  "byteorder",
+ "bytes",
  "chrono",
  "clap",
  "ctrlc",
  "futures",
+ "futures-util",
+ "md5",
  "metrics",
  "metrics-exporter-prometheus",
  "native-tls",
  "once_cell",
  "postgres-native-tls",
- "postgres-protocol",
- "postgres-types",
+ "postgres-protocol 0.6.7",
+ "postgres-replication",
+ "postgres-types 0.2.9",
+ "prometheus",
  "serde",
  "serde_json",
  "thiserror 2.0.12",
@@ -1013,6 +1018,12 @@ dependencies = [
  "cfg-if",
  "digest",
 ]
+
+[[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "memchr"
@@ -1158,6 +1169,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_threads"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "object"
 version = "0.36.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1295,14 +1315,30 @@ checksum = "350e9b48cbc6b0e028b0473b114454c6316e57336ee184ceab6e53f72c178b3e"
 
 [[package]]
 name = "postgres-native-tls"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1f39498473c92f7b6820ae970382c1d83178a3454c618161cb772e8598d9f6f"
+version = "0.5.0"
+source = "git+https://github.com/MaterializeInc/rust-postgres/#c4b473b478b3adfbf8667d2fbe895d8423f1290b"
 dependencies = [
  "native-tls",
  "tokio",
  "tokio-native-tls",
  "tokio-postgres",
+]
+
+[[package]]
+name = "postgres-protocol"
+version = "0.6.7"
+source = "git+https://github.com/MaterializeInc/rust-postgres/#c4b473b478b3adfbf8667d2fbe895d8423f1290b"
+dependencies = [
+ "base64",
+ "byteorder",
+ "bytes",
+ "fallible-iterator",
+ "hmac",
+ "md-5",
+ "memchr",
+ "rand 0.8.5",
+ "sha2",
+ "stringprep",
 ]
 
 [[package]]
@@ -1324,6 +1360,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "postgres-replication"
+version = "0.6.7"
+source = "git+https://github.com/MaterializeInc/rust-postgres/#c4b473b478b3adfbf8667d2fbe895d8423f1290b"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "futures-util",
+ "memchr",
+ "pin-project-lite",
+ "postgres-protocol 0.6.7",
+ "postgres-types 0.2.7",
+ "tokio-postgres",
+]
+
+[[package]]
+name = "postgres-types"
+version = "0.2.7"
+source = "git+https://github.com/MaterializeInc/rust-postgres/#c4b473b478b3adfbf8667d2fbe895d8423f1290b"
+dependencies = [
+ "bytes",
+ "fallible-iterator",
+ "postgres-protocol 0.6.7",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "postgres-types"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1331,10 +1395,7 @@ checksum = "613283563cd90e1dfc3518d548caee47e0e725455ed619881f5cf21f36de4b48"
 dependencies = [
  "bytes",
  "fallible-iterator",
- "postgres-protocol",
- "serde",
- "serde_json",
- "uuid",
+ "postgres-protocol 0.6.8",
 ]
 
 [[package]]
@@ -1370,6 +1431,27 @@ checksum = "02b3e5e68a3a1a02aad3ec490a98007cbc13c37cbe84a3cd7b8e406d76e7f778"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "prometheus"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot",
+ "protobuf",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "protobuf"
+version = "2.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "quanta"
@@ -1899,7 +1981,9 @@ checksum = "8a7619e19bc266e0f9c5e6686659d394bc57973859340060a69221e57dbc0c40"
 dependencies = [
  "deranged",
  "itoa",
+ "libc",
  "num-conv",
+ "num_threads",
  "powerfmt",
  "serde",
  "time-core",
@@ -1978,9 +2062,8 @@ dependencies = [
 
 [[package]]
 name = "tokio-postgres"
-version = "0.7.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c95d533c83082bb6490e0189acaa0bbeef9084e60471b696ca6988cd0541fb0"
+version = "0.7.11"
+source = "git+https://github.com/MaterializeInc/rust-postgres/#c4b473b478b3adfbf8667d2fbe895d8423f1290b"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -1993,9 +2076,9 @@ dependencies = [
  "percent-encoding",
  "phf",
  "pin-project-lite",
- "postgres-protocol",
- "postgres-types",
- "rand 0.9.1",
+ "postgres-protocol 0.6.7",
+ "postgres-types 0.2.7",
+ "rand 0.8.5",
  "socket2",
  "tokio",
  "tokio-util",
@@ -2111,6 +2194,7 @@ dependencies = [
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "time",
  "tracing",
  "tracing-core",
  "tracing-log",
