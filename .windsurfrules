@@ -1,11 +1,13 @@
 ## Rules
+0. Create small rust modules to avoid reaching output context limit
 1. Keep project blazing fast and resilient to failures.
-2. Think from first principles. 
+2. Think from first principles.
 3. Follow SOLID principles
 4. Instrument the code with proper metrics and logging.
 5. Use logfmt format for logging key=value pairs.
-6. Use latest version of rust and cargo and libraries. 
+6. Use latest version of rust and cargo and libraries.
 7. Handle graceful shutdowns.
 8. This may become complex project so divide it into multiple modules as per SOLID principles.
 9. Use tokio for async runtime.
 10. Use pgoutput as replication plugin.
+11. Don't update README.md unless I explicitly ask
