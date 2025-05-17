@@ -1,13 +1,21 @@
-## Rules
-0. Create small rust modules to avoid reaching output context limit
-1. Keep project blazing fast and resilient to failures.
-2. Think from first principles.
-3. Follow SOLID principles
-4. Instrument the code with proper metrics and logging.
-5. Use logfmt format for logging key=value pairs.
-6. Use latest version of rust and cargo and libraries.
-7. Handle graceful shutdowns.
-8. This may become complex project so divide it into multiple modules as per SOLID principles.
-9. Use tokio for async runtime.
-10. Use pgoutput as replication plugin.
-11. Don't update README.md unless I explicitly ask
+- Design from first principles
+- Follow SOLID principles
+- Divide into modular components to manage complexity
+- Create small Rust modules to avoid reaching output context limits
+- Optimize for blazing fast performance
+- Build resilience to failures
+- Handle graceful shutdowns
+- Frequently verify compilation with `cargo check`
+- Structure code to enable graceful error handling
+- Use latest stable Rust and Cargo
+- Use Tokio for async runtime
+- Use postgres_replication for replication logic
+- Configure pgoutput as the replication plugin
+- Instrument code with comprehensive metrics
+- Implement structured logging throughout
+- Use logfmt format for logging (key=value pairs)
+- Include appropriate log levels for different scenarios
+- Compile frequently to catch errors early
+- Maintain modular structure as project complexity increases
+- Make intentional architectural decisions
+- Do not update README.md unless explicitly requested

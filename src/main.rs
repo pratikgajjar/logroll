@@ -1,26 +1,32 @@
-use std::env;
-
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use postgres_replication::protocol::LogicalReplicationMessage;
-use postgres_replication::protocol::ReplicationMessage;
-use postgres_replication::LogicalReplicationStream;
-use tokio_postgres::{NoTls, Config, config::ReplicationMode};
-use tracing::{info, error};
-use tokio_postgres::SimpleQueryMessage::Row;
+use std::env;
+use tracing::{error, info};
+use tracing_subscriber::fmt::format::FmtSpan;
+
+use logroll_cdc::{
+    Config, LogicalReplicationMessage, LogicalReplicationStream, NoTls, ReplicationMessage,
+    ReplicationMode,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing with additional information
+    tracing_subscriber::fmt()
+        .with_span_events(FmtSpan::CLOSE)
+        .with_env_filter(env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
+        .init();
+
+    info!("Starting Logroll CDC v{}", logroll_cdc::VERSION);
 
     // Get configuration from environment variables
-    let conninfo = env::var("POSTGRES_CONNECTION_STRING")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/logroll?replication=database".to_string());
-    let slot_name = env::var("REPLICATION_SLOT_NAME")
-        .unwrap_or_else(|_| "logroll_slot".to_string());
-    let publication_name = env::var("PUBLICATION_NAME")
-        .unwrap_or_else(|_| "logroll_publication".to_string());
+    let conninfo = env::var("POSTGRES_CONNECTION_STRING").unwrap_or_else(|_| {
+        "postgres://postgres:postgres@localhost:5432/logroll?replication=database".to_string()
+    });
+    let slot_name =
+        env::var("REPLICATION_SLOT_NAME").unwrap_or_else(|_| "logroll_slot".to_string());
+    let publication_name =
+        env::var("PUBLICATION_NAME").unwrap_or_else(|_| "logroll_publication".to_string());
     let _create_temp_slot = env::var("CREATE_TEMP_SLOT")
         .unwrap_or_else(|_| "false".to_string())
         .parse::<bool>()
@@ -50,20 +56,21 @@ async fn main() -> Result<()> {
             .await
             .context("Failed to drop existing publication")?;
         client
-            .simple_query(&format!("CREATE PUBLICATION {} FOR ALL TABLES", publication_name))
+            .simple_query(&format!(
+                "CREATE PUBLICATION {} FOR ALL TABLES",
+                publication_name
+            ))
             .await
             .context("Failed to create publication")?;
     }
 
     // Create replication slot
-    info!("Dropping existing replication slot if exists: {}", slot_name);
-    let drop_slot_query = format!(
-        r#"SELECT pg_drop_replication_slot('{}')"#,
+    info!(
+        "Dropping existing replication slot if exists: {}",
         slot_name
     );
-    let _ = client
-        .simple_query(&drop_slot_query)
-        .await;
+    let drop_slot_query = format!(r#"SELECT pg_drop_replication_slot('{}')"#, slot_name);
+    let _ = client.simple_query(&drop_slot_query).await;
 
     // Create a new connection specifically for replication
     let mut config = conninfo.parse::<Config>()?;
@@ -77,16 +84,13 @@ async fn main() -> Result<()> {
     });
 
     // Create replication slot using replication protocol
-    let create_slot_query = format!(
-        r#"CREATE_REPLICATION_SLOT {} LOGICAL pgoutput"#,
-        slot_name
-    );
+    let create_slot_query = format!(r#"CREATE_REPLICATION_SLOT {} LOGICAL pgoutput"#, slot_name);
     // Read the response to get the LSN
-    let slot_query = repl_client.simple_query(&create_slot_query).await.unwrap();
-    let lsn = if let Row(row) = &slot_query[1] {
+    let slot_query = repl_client.simple_query(&create_slot_query).await?;
+    let lsn = if let tokio_postgres::SimpleQueryMessage::Row(row) = &slot_query[1] {
         row.get("consistent_point").unwrap()
     } else {
-        panic!("unexpeced query message");
+        panic!("unexpected query message");
     };
     info!("Replication slot created with LSN: {}", lsn);
 
@@ -98,10 +102,7 @@ async fn main() -> Result<()> {
         r#"START_REPLICATION SLOT {} LOGICAL {} ({})"#,
         slot_name, lsn, options
     );
-    let copy_stream = repl_client
-        .copy_both_simple::<bytes::Bytes>(&query)
-        .await
-        .unwrap();
+    let copy_stream = repl_client.copy_both_simple::<bytes::Bytes>(&query).await?;
 
     let stream = LogicalReplicationStream::new(copy_stream);
     tokio::pin!(stream);
@@ -109,70 +110,69 @@ async fn main() -> Result<()> {
     // Process replication messages
     while let Some(message) = stream.next().await {
         match message {
-            Ok(ReplicationMessage::XLogData(body)) => {
-                match body.into_data() {
-                    LogicalReplicationMessage::Begin(begin) => {
-                        info!("BEGIN: xid={:?}, lsn={:?}", begin.xid(), begin.final_lsn());
-                    }
-                    LogicalReplicationMessage::Commit(commit) => {
-                        info!("COMMIT: {:?}", commit);
-                    }
-                    LogicalReplicationMessage::Insert(insert) => {
-                        info!(
-                            "INSERT: rel_id={:?}, tuple={:?}",
-                            insert.rel_id(),
-                            insert.tuple()
-                        );
-                    }
-                    LogicalReplicationMessage::Update(update) => {
-                        info!(
-                            "UPDATE: rel_id={:?}, old_tuple={:?}, new_tuple={:?}",
-                            update.rel_id(),
-                            update.old_tuple(),
-                            update.new_tuple()
-                        );
-                    }
-                    LogicalReplicationMessage::Delete(delete) => {
-                        info!(
-                            "DELETE: rel_id={:?}, tuple={:?}",
-                            delete.rel_id(),
-                            delete.old_tuple()
-                        );
-                    }
-                    LogicalReplicationMessage::Relation(relation) => {
-                        info!(
-                            "RELATION: id={:?}, name={:?}, columns={:?}",
-                            relation.rel_id(),
-                            relation.name(),
-                            relation.columns()
-                        );
-                    }
-                    LogicalReplicationMessage::Truncate(truncate) => {
-                        info!(
-                            "TRUNCATE: rel_ids={:?}, options={:?}",
-                            truncate.rel_ids(),
-                            truncate.options()
-                        );
-                    }
-                    LogicalReplicationMessage::Type(type_msg) => {
-                        info!(
-                            "TYPE: id={:?}, name={:?}, namespace={:?}",
-                            type_msg.id(),
-                            type_msg.name(),
-                            type_msg.namespace()
-                        );
-                    }
-                    LogicalReplicationMessage::Origin(origin) => {
-                        info!("ORIGIN: {:?}", origin);
-                    }
-                    _ => {
-                        info!("Unhandled LogicalReplicationMessage variant");
-                    }
+            Ok(ReplicationMessage::XLogData(body)) => match body.into_data() {
+                LogicalReplicationMessage::Begin(begin) => {
+                    info!("BEGIN: xid={:?}, lsn={:?}", begin.xid(), begin.final_lsn());
                 }
-            }
+                LogicalReplicationMessage::Commit(commit) => {
+                    info!("COMMIT: {:?}", commit);
+                }
+                LogicalReplicationMessage::Insert(insert) => {
+                    info!(
+                        "INSERT: rel_id={:?}, tuple={:?}",
+                        insert.rel_id(),
+                        insert.tuple()
+                    );
+                }
+                LogicalReplicationMessage::Update(update) => {
+                    info!(
+                        "UPDATE: rel_id={:?}, old_tuple={:?}, new_tuple={:?}",
+                        update.rel_id(),
+                        update.old_tuple(),
+                        update.new_tuple()
+                    );
+                }
+                LogicalReplicationMessage::Delete(delete) => {
+                    info!(
+                        "DELETE: rel_id={:?}, tuple={:?}",
+                        delete.rel_id(),
+                        delete.old_tuple()
+                    );
+                }
+                LogicalReplicationMessage::Relation(relation) => {
+                    info!(
+                        "RELATION: id={:?}, name={:?}, columns={:?}",
+                        relation.rel_id(),
+                        relation.name(),
+                        relation.columns()
+                    );
+                }
+                LogicalReplicationMessage::Truncate(truncate) => {
+                    info!(
+                        "TRUNCATE: rel_ids={:?}, options={:?}",
+                        truncate.rel_ids(),
+                        truncate.options()
+                    );
+                }
+                LogicalReplicationMessage::Type(type_msg) => {
+                    info!(
+                        "TYPE: id={:?}, name={:?}, namespace={:?}",
+                        type_msg.id(),
+                        type_msg.name(),
+                        type_msg.namespace()
+                    );
+                }
+                LogicalReplicationMessage::Origin(origin) => {
+                    info!("ORIGIN: {:?}", origin);
+                }
+                _ => {
+                    info!("Unhandled LogicalReplicationMessage variant");
+                }
+            },
             Ok(ReplicationMessage::PrimaryKeepAlive(keepalive)) => {
                 info!("KEEPALIVE: {:?}", keepalive);
-                // TODO: Send status update if required by your library's API
+                // We'll just log the keepalive messages for now
+                // Status updates would normally be sent here if required
             }
             Ok(_) => {}
             Err(e) => {
@@ -182,5 +182,6 @@ async fn main() -> Result<()> {
         }
     }
 
+    info!("Logroll CDC shutting down");
     Ok(())
-} 
+}
