@@ -5,6 +5,9 @@
 //! to consume database changes for building CDC (Change Data Capture)
 //! pipelines, event sourcing systems, and more.
 
+// Module declarations
+pub mod processor;
+
 /// Version of the library
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -15,3 +18,6 @@ pub use postgres_replication::{
 };
 pub use postgres_types::PgLsn;
 pub use tokio_postgres::{config::ReplicationMode, Client, Config, NoTls};
+
+// Re-export our processor types
+pub use processor::{ChangeProcessor, ChangeRecord, ProcessorConfig, extract_record_data};
