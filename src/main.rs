@@ -1,4 +1,3 @@
-use std::time::{Duration, UNIX_EPOCH};
 use std::env;
 
 use anyhow::{Context, Result};
@@ -6,7 +5,6 @@ use futures_util::StreamExt;
 use postgres_replication::protocol::LogicalReplicationMessage;
 use postgres_replication::protocol::ReplicationMessage;
 use postgres_replication::LogicalReplicationStream;
-use postgres_types::PgLsn;
 use tokio_postgres::{NoTls, Config, config::ReplicationMode};
 use tracing::{info, error};
 use tokio_postgres::SimpleQueryMessage::Row;
@@ -23,7 +21,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "logroll_slot".to_string());
     let publication_name = env::var("PUBLICATION_NAME")
         .unwrap_or_else(|_| "logroll_publication".to_string());
-    let create_temp_slot = env::var("CREATE_TEMP_SLOT")
+    let _create_temp_slot = env::var("CREATE_TEMP_SLOT")
         .unwrap_or_else(|_| "false".to_string())
         .parse::<bool>()
         .unwrap_or(false);
