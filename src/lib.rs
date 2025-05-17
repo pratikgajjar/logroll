@@ -21,3 +21,4 @@ pub use tokio_postgres::{config::ReplicationMode, Client, Config, NoTls};
 
 // Re-export our processor types
 pub use processor::{ChangeProcessor, ChangeRecord, ProcessorConfig, extract_record_data};
+pub use std::collections::HashMap;

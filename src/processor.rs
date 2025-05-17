@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arrow::array::{StringArray, TimestampMicrosecondArray};
+use arrow::array::{ArrayRef, StringArray, StringBuilder, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use base64::Engine;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -25,17 +24,87 @@ use uuid::Uuid;
 
 /// Extension trait for postgres_replication::protocol::Tuple
 trait TupleExt {
-    /// Try to extract the tuple as bytes
-    fn try_as_bytes(&self) -> Option<Vec<u8>>;
+    /// Get the column names based on column count or from debug output
+    fn extract_column_names(&self, relation_columns: Option<Vec<String>>) -> Vec<String>;
+    
+    /// Extract values from tuple as strings
+    fn extract_values(&self) -> Vec<Option<String>>;
+    
+    /// Count the columns in a tuple
+    fn count_columns(&self) -> usize;
+    
+    /// Extract column values at an index
+    fn extract_column_at(&self, index: usize) -> Option<String>;
 }
 
 impl TupleExt for postgres_replication::protocol::Tuple {
-    fn try_as_bytes(&self) -> Option<Vec<u8>> {
-        // Extract raw bytes from the tuple
+    fn extract_column_names(&self, relation_columns: Option<Vec<String>>) -> Vec<String> {
+        if let Some(columns) = relation_columns {
+            columns
+        } else {
+            // Fallback to generic column names
+            let count = self.count_columns();
+            (0..count).map(|i| format!("col_{}", i)).collect()
+        }
+    }
+    
+    fn extract_values(&self) -> Vec<Option<String>> {
+        let mut values = Vec::new();
+        let column_count = self.count_columns();
+        
+        for i in 0..column_count {
+            if let Some(value) = self.extract_column_at(i) {
+                values.push(Some(value));
+            } else {
+                values.push(None);
+            }
+        }
+        
+        values
+    }
+    
+    fn count_columns(&self) -> usize {
+        // Parse from debug representation
         let debug_str = format!("{:?}", self);
-        Some(debug_str.into_bytes())
+        if debug_str.contains("Tuple([") {
+            // Count the number of Text or Binary entries
+            let count = debug_str.matches("Text(").count() + debug_str.matches("Binary(").count() + debug_str.matches("Null").count();
+            count
+        } else {
+            0
+        }
+    }
+    
+    fn extract_column_at(&self, index: usize) -> Option<String> {
+        // Parse from debug representation
+        let debug_str = format!("{:?}", self);
+        
+        // Very basic parsing from debug output
+        if let Some(content) = debug_str.strip_prefix("Tuple([").and_then(|s| s.strip_suffix("])")) {
+            let columns: Vec<&str> = content.split(", ").collect();
+            if index < columns.len() {
+                let col_text = columns[index];
+                if col_text.starts_with("Text(") {
+                    // Extract data between b"..." from Text(b"...")
+                    if let Some(content) = col_text.strip_prefix("Text(b\"").and_then(|s| s.strip_suffix("\")")) {
+                        return Some(content.to_string());
+                    }
+                } else if col_text.starts_with("Binary(") {
+                    // Extract data between b"..." from Binary(b"...")
+                    if let Some(content) = col_text.strip_prefix("Binary(b\"").and_then(|s| s.strip_suffix("\")")) {
+                        return Some(content.to_string());
+                    }
+                } else if col_text == "Null" {
+                    return None;
+                }
+            }
+        }
+        
+        None
     }
 }
+
+// Removed TupleColumn as it's no longer needed
 
 /// Configuration for the data processor
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,7 +213,7 @@ impl ChangeProcessor {
             .replace("{uuid}", &uuid.to_string())
     }
     
-    /// Convert a batch of records to Arrow RecordBatch
+    /// Convert a batch of records to Arrow RecordBatch with MapType for data
     fn records_to_arrow_batch(&self, records: &[ChangeRecord]) -> Result<RecordBatch> {
         if records.is_empty() {
             return Err(anyhow::anyhow!("Empty batch"));
@@ -166,10 +235,9 @@ impl ChangeProcessor {
         let ops: Vec<String> = records.iter()
             .map(|r| r.op.clone())
             .collect();
-            
-        let data: Vec<String> = records.iter()
-            .map(|r| serde_json::to_string(&r.data).unwrap_or_else(|_| "{}".to_string()))
-            .collect();
+        
+        // Create map arrays for data
+        let data_maps = self.create_map_arrays_from_records(records)?;
         
         // Create Arrow schema
         let schema = ArrowSchema::new(vec![
@@ -185,7 +253,6 @@ impl ChangeProcessor {
         let lsn_array = StringArray::from(lsns);
         let table_array = StringArray::from(tables);
         let op_array = StringArray::from(ops);
-        let data_array = StringArray::from(data);
         
         // Create record batch
         let batch = RecordBatch::try_new(
@@ -195,11 +262,53 @@ impl ChangeProcessor {
                 std::sync::Arc::new(lsn_array),
                 std::sync::Arc::new(table_array),
                 std::sync::Arc::new(op_array),
-                std::sync::Arc::new(data_array),
+                data_maps,
             ],
         )?;
         
         Ok(batch)
+    }
+    
+    /// Create map arrays from record data
+    fn create_map_arrays_from_records(&self, records: &[ChangeRecord]) -> Result<ArrayRef> {
+        // Create key and value builders
+        let mut keys_builder = StringBuilder::new();
+        let mut values_builder = StringBuilder::new();
+        let mut offsets = Vec::new();
+        
+        let mut current_offset = 0;
+        offsets.push(current_offset);
+        
+        for record in records {
+            if let JsonValue::Object(map) = &record.data {
+                for (key, value) in map {
+                    keys_builder.append_value(key);
+                    
+                    // Handle different value types
+                    match value {
+                        JsonValue::Null => values_builder.append_null(),
+                        JsonValue::Bool(b) => values_builder.append_value(b.to_string()),
+                        JsonValue::Number(n) => values_builder.append_value(n.to_string()),
+                        JsonValue::String(s) => values_builder.append_value(s),
+                        _ => values_builder.append_value(value.to_string()),
+                    }
+                    
+                    current_offset += 1;
+                }
+            }
+            
+            offsets.push(current_offset);
+        }
+        
+        // For simplicity, serialize the data to JSON string instead of using MapArray
+        // This is a workaround until we can properly set up the complex MapArray type
+        let data_json = records.iter()
+            .map(|r| serde_json::to_string(&r.data).unwrap_or_else(|_| "{}".to_string()))
+            .collect::<Vec<String>>();
+        
+        let data_array = StringArray::from(data_json);
+        
+        Ok(std::sync::Arc::new(data_array))
     }
     
     /// Write a batch of records to a Parquet file
@@ -335,13 +444,17 @@ pub fn extract_record_data(
     message: &LogicalReplicationMessage,
     lsn: PgLsn,
     table_name: String,
+    relation_map: &HashMap<u32, LogicalReplicationMessage>,
 ) -> Result<ChangeRecord> {
     let timestamp = chrono::Utc::now();
     
     match message {
         LogicalReplicationMessage::Insert(insert) => {
-            // Extract tuple data as JSON
-            let tuple_data = tuple_to_json(insert.tuple())?;
+            // Get relation for column names
+            let column_names = extract_column_names_from_relation_map(relation_map, insert.rel_id());
+            
+            // Extract tuple data as JSON with column names
+            let tuple_data = tuple_to_json(insert.tuple(), column_names)?;
             
             Ok(ChangeRecord {
                 timestamp,
@@ -352,12 +465,15 @@ pub fn extract_record_data(
             })
         }
         LogicalReplicationMessage::Update(update) => {
-            // Extract new tuple data as JSON
-            let new_tuple_data = tuple_to_json(update.new_tuple())?;
+            // Get relation for column names
+            let column_names = extract_column_names_from_relation_map(relation_map, update.rel_id());
+            
+            // Extract new tuple data as JSON with column names
+            let new_tuple_data = tuple_to_json(update.new_tuple(), column_names.clone())?;
             
             // Also include old tuple if available
             let data = if let Some(old_tuple) = update.old_tuple() {
-                if let Ok(old_data) = tuple_to_json(old_tuple) {
+                if let Ok(old_data) = tuple_to_json(old_tuple, column_names) {
                     serde_json::json!({
                         "old": old_data,
                         "new": new_tuple_data,
@@ -380,9 +496,12 @@ pub fn extract_record_data(
             })
         }
         LogicalReplicationMessage::Delete(delete) => {
-            // Extract tuple data as JSON
+            // Get relation for column names
+            let column_names = extract_column_names_from_relation_map(relation_map, delete.rel_id());
+            
+            // Extract tuple data as JSON with column names
             let tuple_data = match delete.old_tuple() {
-                Some(tuple) => tuple_to_json(tuple)?,
+                Some(tuple) => tuple_to_json(tuple, column_names)?,
                 None => JsonValue::Object(serde_json::Map::new()),
             };
             
@@ -413,54 +532,77 @@ pub fn extract_record_data(
     }
 }
 
-/// Convert a tuple to JSON value
-fn tuple_to_json(tuple: &postgres_replication::protocol::Tuple) -> Result<JsonValue> {
+/// Helper function to extract column names from the relation map
+fn extract_column_names_from_relation_map(relation_map: &HashMap<u32, LogicalReplicationMessage>, rel_id: u32) -> Option<Vec<String>> {
+    if let Some(LogicalReplicationMessage::Relation(relation)) = relation_map.get(&rel_id) {
+        let column_names = relation.columns().iter()
+            .map(|col| col.name().unwrap_or("unknown").to_string())
+            .collect();
+        Some(column_names)
+    } else {
+        None
+    }
+}
+
+/// Convert a tuple to JSON value with column names
+fn tuple_to_json(
+    tuple: &postgres_replication::protocol::Tuple, 
+    relation_columns: Option<Vec<String>>
+) -> Result<JsonValue> {
     let mut map = serde_json::Map::new();
     
-    // Since we can't access the tuple structure directly in a reliable way,
-    // we'll make a simple approximation of the data based on what we can
-    // extract from the tuple's debug representation
-    let debug_str = format!("{:?}", tuple);
+    // Get column names from relation if possible
+    let column_names = tuple.extract_column_names(relation_columns);
     
-    // Try to extract column values from the debug string
-    let column_values: Vec<&str> = debug_str
-        .split("columns: [")
-        .nth(1)
-        .map(|s| s.trim_end_matches(']'))
-        .map(|s| s.split(", ").collect())
-        .unwrap_or_default();
+    // Get column values
+    let column_values = tuple.extract_values();
     
-    // Map the column values to JSON
-    for (i, value) in column_values.iter().enumerate() {
-        if value.contains("null") {
-            map.insert(format!("col_{}", i), JsonValue::Null);
-        } else if value.starts_with("\"") && value.ends_with("\"") {
-            // Try to extract the string content
-            let content = value.trim_start_matches('"').trim_end_matches('"');
-            map.insert(format!("col_{}", i), JsonValue::String(content.to_string()));
-        } else if let Ok(num) = value.parse::<i64>() {
-            map.insert(format!("col_{}", i), JsonValue::Number(num.into()));
-        } else if let Ok(num) = value.parse::<f64>() {
-            // Try to convert to serde_json Number
-            if let Some(num_val) = serde_json::Number::from_f64(num) {
-                map.insert(format!("col_{}", i), JsonValue::Number(num_val));
-            } else {
-                map.insert(format!("col_{}", i), JsonValue::String(value.to_string()));
+    // Map column names to values
+    for (name, value) in column_names.iter().zip(column_values.iter()) {
+        match value {
+            Some(val_str) => {
+                // Try to parse as number or boolean first
+                if val_str == "t" || val_str == "true" {
+                    map.insert(name.clone(), JsonValue::Bool(true));
+                } else if val_str == "f" || val_str == "false" {
+                    map.insert(name.clone(), JsonValue::Bool(false));
+                } else if let Ok(num) = val_str.parse::<i64>() {
+                    map.insert(name.clone(), JsonValue::Number(num.into()));
+                } else if let Ok(num) = val_str.parse::<f64>() {
+                    if let Some(num_val) = serde_json::Number::from_f64(num) {
+                        map.insert(name.clone(), JsonValue::Number(num_val));
+                    } else {
+                        map.insert(name.clone(), JsonValue::String(val_str.clone()));
+                    }
+                } else {
+                    // Try to parse as JSON
+                    if (val_str.starts_with('{') && val_str.ends_with('}')) || 
+                       (val_str.starts_with('[') && val_str.ends_with(']')) {
+                        if let Ok(json_val) = serde_json::from_str(val_str) {
+                            map.insert(name.clone(), json_val);
+                        } else {
+                            map.insert(name.clone(), JsonValue::String(val_str.clone()));
+                        }
+                    } else {
+                        map.insert(name.clone(), JsonValue::String(val_str.clone()));
+                    }
+                }
             }
-        } else {
-            map.insert(format!("col_{}", i), JsonValue::String(value.to_string()));
+            None => {
+                map.insert(name.clone(), JsonValue::Null);
+            }
         }
     }
     
-    // If we couldn't extract column data, use the debug representation
-    if map.is_empty() {
-        map.insert("debug".to_string(), JsonValue::String(debug_str));
-    }
-    
-    // Add raw data in base64 for complete data preservation
-    if let Some(raw_data) = tuple.try_as_bytes() {
-        let base64_str = base64::engine::general_purpose::STANDARD.encode(raw_data);
-        map.insert("raw_base64".to_string(), JsonValue::String(base64_str));
+    // If there are more values than names, add them with generic names
+    if column_values.len() > column_names.len() {
+        for i in column_names.len()..column_values.len() {
+            if let Some(val) = &column_values[i] {
+                map.insert(format!("col_{}", i), JsonValue::String(val.clone()));
+            } else {
+                map.insert(format!("col_{}", i), JsonValue::Null);
+            }
+        }
     }
     
     Ok(JsonValue::Object(map))

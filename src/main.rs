@@ -140,8 +140,8 @@ async fn main() -> Result<()> {
     let stream = LogicalReplicationStream::new(copy_stream);
     tokio::pin!(stream);
 
-    // Map to store relation_id -> table_name mappings
-    let mut relation_table_map = std::collections::HashMap::new();
+        // Map to store relation_id -> relation object mappings for column info
+        let mut relation_map = std::collections::HashMap::<u32, logroll_cdc::LogicalReplicationMessage>::new();
     
     // Process replication messages
     while let Some(message) = stream.next().await {
@@ -171,8 +171,8 @@ async fn main() -> Result<()> {
                             relation.columns().len()
                         );
                         
-                        // Store relation mapping
-                        relation_table_map.insert(rel_id, table_name);
+                        // Store relation mapping with full relation message
+                        relation_map.insert(rel_id, LogicalReplicationMessage::Relation(relation));
                     }
                     msg @ LogicalReplicationMessage::Insert(_) |
                     msg @ LogicalReplicationMessage::Update(_) |
@@ -189,9 +189,14 @@ async fn main() -> Result<()> {
                         
                         // Get table name from relation ID
                         let table_name = if let Some(id) = rel_id {
-                            relation_table_map.get(&id)
-                                .cloned()
-                                .unwrap_or_else(|| format!("unknown_table_{}", id))
+                            match relation_map.get(&id) {
+                                Some(LogicalReplicationMessage::Relation(rel)) => format!(
+                                    "{}.{}",
+                                    rel.namespace().unwrap_or("public"),
+                                    rel.name().unwrap_or("unknown_table")
+                                ),
+                                _ => format!("unknown_table_{}", id)
+                            }
                         } else {
                             "multiple_tables".to_string()
                         };
@@ -214,7 +219,7 @@ async fn main() -> Result<()> {
                         }
                         
                         // Extract data and send to processor
-                        match extract_record_data(&msg, lsn, table_name) {
+                        match extract_record_data(&msg, lsn, table_name, &relation_map) {
                             Ok(record) => {
                                 if let Err(e) = tx.send(record).await {
                                     warn!("Failed to send record to processor: {}", e);
