@@ -96,11 +96,15 @@ async fn main() -> Result<()> {
     let _ = client.simple_query(&drop_slot_query).await;
     
     // Initialize the processor
-    let processor = ChangeProcessor::new(processor_config, rx);
+    let processor = ChangeProcessor::new(processor_config);
+    
+    // Clone processor handle for registering relations and main loop
+    let processor_for_registration = processor.clone();
+    let processor_for_main = processor.clone();
     
     // Start the processor in a separate task
     let processor_handle = tokio::spawn(async move {
-        if let Err(e) = processor.start().await {
+        if let Err(e) = processor.start_processing(rx).await {
             error!("Processor error: {}", e);
         }
     });
@@ -140,8 +144,8 @@ async fn main() -> Result<()> {
     let stream = LogicalReplicationStream::new(copy_stream);
     tokio::pin!(stream);
 
-        // Map to store relation_id -> relation object mappings for column info
-        let mut relation_map = std::collections::HashMap::<u32, logroll_cdc::LogicalReplicationMessage>::new();
+        // Track processed relations
+        let mut processed_relations = std::collections::HashSet::<u32>::new();
     
     // Process replication messages
     while let Some(message) = stream.next().await {
@@ -171,8 +175,10 @@ async fn main() -> Result<()> {
                             relation.columns().len()
                         );
                         
-                        // Store relation mapping with full relation message
-                        relation_map.insert(rel_id, LogicalReplicationMessage::Relation(relation));
+                        // Create a new relation message for registration
+                        let rel_msg = LogicalReplicationMessage::Relation(relation);
+                        processor_for_registration.register_relation(rel_id, rel_msg).await;
+                        processed_relations.insert(rel_id);
                     }
                     msg @ LogicalReplicationMessage::Insert(_) |
                     msg @ LogicalReplicationMessage::Update(_) |
@@ -189,14 +195,8 @@ async fn main() -> Result<()> {
                         
                         // Get table name from relation ID
                         let table_name = if let Some(id) = rel_id {
-                            match relation_map.get(&id) {
-                                Some(LogicalReplicationMessage::Relation(rel)) => format!(
-                                    "{}.{}",
-                                    rel.namespace().unwrap_or("public"),
-                                    rel.name().unwrap_or("unknown_table")
-                                ),
-                                _ => format!("unknown_table_{}", id)
-                            }
+                            processor_for_registration.get_table_name(id).await
+                                .unwrap_or_else(|| format!("unknown_table_{}", id))
                         } else {
                             "multiple_tables".to_string()
                         };
@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
                         }
                         
                         // Extract data and send to processor
-                        match extract_record_data(&msg, lsn, table_name, &relation_map) {
+                        match extract_record_data(&msg, lsn, table_name.clone(), rel_id) {
                             Ok(record) => {
                                 if let Err(e) = tx.send(record).await {
                                     warn!("Failed to send record to processor: {}", e);
@@ -260,6 +260,9 @@ async fn main() -> Result<()> {
     }
 
     info!("Logroll CDC shutting down, waiting for processor to finish");
+    
+    // Flush any remaining records
+    processor_for_main.flush_batch().await?;
     
     // Drop the sender to signal the processor to finish
     drop(tx);

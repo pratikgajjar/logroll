@@ -1,6 +1,8 @@
 -- Data generation script for postgres_data_types table
+UPDATE postgres_data_types SET integer_val = integer_val + 1 WHERE id <= 5;
+
 WITH config AS (
-    SELECT 10 AS row_count  -- change to desired N
+    SELECT 5 AS row_count  -- change to desired N
 ), series AS (
     SELECT generate_series(1, (SELECT row_count FROM config)) AS i
 )
