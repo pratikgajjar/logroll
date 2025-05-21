@@ -9,10 +9,10 @@ description = "A tool to read PostgreSQL CDC changes and log them to stdout"
 tokio-postgres = { version = "0.7.11", features = [
     "with-serde_json-1",
     "with-uuid-1",
-], git = "https://github.com/MaterializeInc/rust-postgres/" }
-postgres-native-tls = { git = "https://github.com/MaterializeInc/rust-postgres/", version = "0.5.0" }
-postgres-protocol = { git = "https://github.com/MaterializeInc/rust-postgres/", version = "0.6.7" }
-postgres-replication = { git = "https://github.com/MaterializeInc/rust-postgres/", version = "0.6.7" }
+], git = "https://github.com/imor/rust-postgres/" }
+postgres-native-tls = { git = "https://github.com/imor/rust-postgres/", version = "0.5.0" }
+postgres-protocol = { git = "https://github.com/imor/rust-postgres/", version = "0.6.7" }
+postgres-replication = { git = "https://github.com/imor/rust-postgres/", version = "0.6.7" }
 postgres-types = "0.2.9"
 byteorder = "1.5.0"
 native-tls = "0.2.14"

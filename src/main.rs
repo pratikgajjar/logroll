@@ -286,7 +286,14 @@ async fn main() -> Result<()> {
                         }
                         
                         // Extract data and send to processor
-                        match extract_record_data(&msg, lsn, table_name.clone(), rel_id) {
+                        // Get column names for the relation if available
+                        let column_names = if let Some(id) = rel_id {
+                            processor_for_registration.get_relation_columns(id).await
+                        } else {
+                            None
+                        };
+                        
+                        match extract_record_data(&msg, lsn, table_name.clone(), rel_id, column_names) {
                             Ok(record) => {
                                 if let Err(e) = tx.send(record).await {
                                     warn!("Failed to send record to processor: {}", e);

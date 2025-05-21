@@ -2714,7 +2714,7 @@ checksum = "350e9b48cbc6b0e028b0473b114454c6316e57336ee184ceab6e53f72c178b3e"
 [[package]]
 name = "postgres-native-tls"
 version = "0.5.0"
-source = "git+https://github.com/MaterializeInc/rust-postgres/#c4b473b478b3adfbf8667d2fbe895d8423f1290b"
+source = "git+https://github.com/imor/rust-postgres/#548f00c4cbcf7bd714c29cfd2fea7685040c9987"
 dependencies = [
  "native-tls",
  "tokio",
@@ -2725,7 +2725,7 @@ dependencies = [
 [[package]]
 name = "postgres-protocol"
 version = "0.6.7"
-source = "git+https://github.com/MaterializeInc/rust-postgres/#c4b473b478b3adfbf8667d2fbe895d8423f1290b"
+source = "git+https://github.com/imor/rust-postgres/#548f00c4cbcf7bd714c29cfd2fea7685040c9987"
 dependencies = [
  "base64 0.22.1",
  "byteorder",
@@ -2760,7 +2760,7 @@ dependencies = [
 [[package]]
 name = "postgres-replication"
 version = "0.6.7"
-source = "git+https://github.com/MaterializeInc/rust-postgres/#c4b473b478b3adfbf8667d2fbe895d8423f1290b"
+source = "git+https://github.com/imor/rust-postgres/#548f00c4cbcf7bd714c29cfd2fea7685040c9987"
 dependencies = [
  "byteorder",
  "bytes",
@@ -2775,7 +2775,7 @@ dependencies = [
 [[package]]
 name = "postgres-types"
 version = "0.2.7"
-source = "git+https://github.com/MaterializeInc/rust-postgres/#c4b473b478b3adfbf8667d2fbe895d8423f1290b"
+source = "git+https://github.com/imor/rust-postgres/#548f00c4cbcf7bd714c29cfd2fea7685040c9987"
 dependencies = [
  "bytes",
  "fallible-iterator",
@@ -3685,7 +3685,7 @@ dependencies = [
 [[package]]
 name = "tokio-postgres"
 version = "0.7.11"
-source = "git+https://github.com/MaterializeInc/rust-postgres/#c4b473b478b3adfbf8667d2fbe895d8423f1290b"
+source = "git+https://github.com/imor/rust-postgres/#548f00c4cbcf7bd714c29cfd2fea7685040c9987"
 dependencies = [
  "async-trait",
  "byteorder",

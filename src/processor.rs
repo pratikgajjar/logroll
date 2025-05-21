@@ -489,26 +489,22 @@ impl ChangeProcessor {
             .set_compression(parquet::basic::Compression::ZSTD(parquet::basic::ZstdLevel::try_new(3).unwrap_or_default()))
             .build();
         
-        // Create a temporary file first
-        let temp_file = tempfile::NamedTempFile::new()?;
-        let temp_path = temp_file.path().to_path_buf();
+        // Create the output file directly - no temporary file dance needed
+        let file = File::create(&output_path).await?;
+        let file = file.into_std().await;
         
-        // Write to the temporary file
-        {
-            let file = File::create(&temp_path).await?;
-            let file = file.into_std().await;
-            
-            let mut writer = ArrowWriter::try_new(file, record_batch.schema(), Some(props))?;
-            writer.write(&record_batch)?;
-            writer.close()?;
-        }
+        // Create the Arrow Parquet writer with ZSTD compression
+        let mut writer = ArrowWriter::try_new(file, record_batch.schema(), Some(props))?;
+        
+        // Write the batch to the Parquet file
+        writer.write(&record_batch)?;
+        
+        // Ensure the writer is properly closed, which writes the Parquet footer
+        writer.close()?;
         
         // Get file size
-        let metadata = tokio::fs::metadata(&temp_path).await?;
+        let metadata = tokio::fs::metadata(&output_path).await?;
         let file_size = metadata.len();
-        
-        // Move the temporary file to the final location
-        tokio::fs::copy(&temp_path, &output_path).await?;
         
         // Update current file size
         self.state.current_file_size.fetch_add(file_size, Ordering::Relaxed);

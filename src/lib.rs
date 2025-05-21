@@ -26,74 +26,148 @@ pub use std::collections::HashMap;
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::{Map, Value as JsonValue};
+use postgres_replication::protocol::Tuple;
 
-/// Convert a tuple to a JSON object with proper column names
-fn tuple_to_json(tuple: &postgres_replication::protocol::Tuple, relation: Option<&LogicalReplicationMessage>) -> JsonValue {
+/// Convert a tuple to a JSON object with proper column names using direct access to tuple data
+fn tuple_to_json(tuple: &Tuple, column_names: Option<&[String]>) -> JsonValue {
     let mut map = Map::new();
     
-    // Get column names if relation is available
-    let column_names = if let Some(LogicalReplicationMessage::Relation(rel)) = relation {
-        rel.columns().iter()
-            .map(|col| col.name().unwrap_or("unknown").to_string())
-            .collect::<Vec<_>>()
-    } else {
-        // Default to generic column names
-        let debug_str = format!("{:?}", tuple);
-        let count = debug_str.matches("Text(").count() + debug_str.matches("Binary(").count();
-        (0..count).map(|i| format!("col_{}", i)).collect()
-    };
+    // Get tuple data directly from the tuple using the tuple_data() method
+    let tuple_data = tuple.tuple_data();
     
-    // Parse the tuple's debug representation to extract values
-    let debug_str = format!("{:?}", tuple);
+    // Debug output for troubleshooting
+    tracing::debug!(tuple_data_len = tuple_data.len(), "Tuple data values");
     
-    // Basic parsing from debug output
-    if let Some(content) = debug_str.strip_prefix("Tuple([").and_then(|s| s.strip_suffix("])")) {
-        let columns: Vec<&str> = content.split(", ").collect();
-        for (i, col) in columns.iter().enumerate() {
-            let name = if i < column_names.len() {
-                column_names[i].clone()
+    // Empty tuple handling
+    if tuple_data.is_empty() {
+        return JsonValue::Object(map);
+    }
+
+    // Process each column's data
+    for (i, data) in tuple_data.iter().enumerate() {
+        // Determine column name
+        let column_name = if let Some(names) = column_names {
+            if i < names.len() {
+                names[i].clone()
             } else {
                 format!("col_{}", i)
-            };
-
-            // Extract value from debug string
-            let value = if *col == "Null" {
-                JsonValue::Null
-            } else if col.starts_with("Text(") {
-                // Extract data between b"..." from Text(b"...")
-                if let Some(content) = col.strip_prefix("Text(b\"").and_then(|s| s.strip_suffix("\")")) {
-                    // Try to parse as JSON or convert to appropriate type
-                    if (content.starts_with('{') && content.ends_with('}')) || 
-                    (content.starts_with('[') && content.ends_with(']')) {
-                        serde_json::from_str(content).unwrap_or(JsonValue::String(content.to_string()))
-                    } else if content == "t" || content == "true" {
-                        JsonValue::Bool(true)
-                    } else if content == "f" || content == "false" {
-                        JsonValue::Bool(false)
-                    } else if let Ok(num) = content.parse::<i64>() {
-                        JsonValue::Number(num.into())
-                    } else if let Ok(num) = content.parse::<f64>() {
-                        serde_json::Number::from_f64(num)
-                            .map(JsonValue::Number)
-                            .unwrap_or_else(|| JsonValue::String(content.to_string()))
-                    } else {
-                        JsonValue::String(content.to_string())
-                    }
-                } else {
-                    JsonValue::String("<text data>".to_string())
-                }
-            } else if col.starts_with("Binary(") {
-                // Binary data
-                JsonValue::String("<binary data>".to_string())
-            } else {
-                JsonValue::String(col.to_string())
-            };
-            
-            map.insert(name, value);
-        }
+            }
+        } else {
+            format!("col_{}", i)
+        };
+        
+        // Convert the tuple data to appropriate JSON value
+        let json_value = match data {
+            postgres_replication::protocol::TupleData::Null => JsonValue::Null,
+            postgres_replication::protocol::TupleData::Text(bytes) => {
+                // Handle text values
+                let text = String::from_utf8_lossy(bytes);
+                parse_text_value(&text)
+            },
+            // The imor fork doesn't have TupleData::Binary, adapt to available variants
+            postgres_replication::protocol::TupleData::UnchangedToast => {
+                // For unchanged TOAST data, provide a placeholder
+                JsonValue::String("<unchanged toast>".to_string())
+            },
+        };
+        
+        map.insert(column_name, json_value);
     }
     
     JsonValue::Object(map)
+}
+
+/// Parse a PostgreSQL text value into an appropriate JSON value
+fn parse_text_value(text: &str) -> JsonValue {
+    // Debug the text value
+    tracing::debug!(text = %text, "Parsing text value");
+    
+    // Handle NULL values
+    if text.is_empty() || text == "NULL" || text.eq_ignore_ascii_case("null") {
+        return JsonValue::Null;
+    }
+    
+    // Handle boolean values
+    if text == "t" || text.eq_ignore_ascii_case("true") {
+        return JsonValue::Bool(true);
+    } else if text == "f" || text.eq_ignore_ascii_case("false") {
+        return JsonValue::Bool(false);
+    }
+    
+    // Try to parse as JSON
+    if (text.starts_with('{') && text.ends_with('}')) ||
+       (text.starts_with('[') && text.ends_with(']')) {
+        if let Ok(json) = serde_json::from_str(text) {
+            return json;
+        }
+    }
+    
+    // Try numeric values
+    if let Ok(i) = text.parse::<i64>() {
+        return JsonValue::Number(i.into());
+    }
+    
+    if let Ok(f) = text.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return JsonValue::Number(n);
+        }
+    }
+    
+    // Default to string
+    JsonValue::String(text.to_string())
+}
+
+// Parse PostgreSQL array values into a JSON array
+fn parse_pg_array(text: &str) -> JsonValue {
+    if !text.starts_with('{') || !text.ends_with('}') {
+        return JsonValue::String(text.to_string());
+    }
+    
+    // Extract the content between { }
+    let content = &text[1..text.len()-1];
+    if content.is_empty() {
+        return JsonValue::Array(Vec::new());
+    }
+    
+    // Split the array elements, handling nested structures
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut nesting = 0;
+    let mut in_quotes = false;
+    
+    for c in content.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(c);
+            },
+            '{' | '[' if !in_quotes => {
+                nesting += 1;
+                current.push(c);
+            },
+            '}' | ']' if !in_quotes => {
+                nesting -= 1;
+                current.push(c);
+            },
+            ',' if !in_quotes && nesting == 0 => {
+                // End of element
+                let element = current.trim();
+                if !element.is_empty() {
+                    result.push(parse_text_value(element));
+                }
+                current.clear();
+            },
+            _ => current.push(c),
+        }
+    }
+    
+    // Add the last element
+    let last = current.trim();
+    if !last.is_empty() {
+        result.push(parse_text_value(last));
+    }
+    
+    JsonValue::Array(result)
 }
 
 /// Extract data from a replication message
@@ -102,13 +176,14 @@ pub fn extract_record_data(
     lsn: PgLsn,
     table_name: String,
     _relation_id: Option<u32>,
+    column_names: Option<Vec<String>>,
 ) -> Result<processor::ChangeRecord> {
     let timestamp = Utc::now();
     
     match message {
         LogicalReplicationMessage::Insert(insert) => {
-            // Extract tuple data using native structs
-            let tuple_data = tuple_to_json(insert.tuple(), None);
+            // Extract tuple data using native structs with column names
+            let tuple_data = tuple_to_json(insert.tuple(), column_names.as_deref());
             
             Ok(processor::ChangeRecord {
                 timestamp,
@@ -121,11 +196,12 @@ pub fn extract_record_data(
             })
         }
         LogicalReplicationMessage::Update(update) => {
-            // Extract new tuple data
-            let new_tuple_data = tuple_to_json(update.new_tuple(), None);
+            // Extract new tuple data with column names
+            let new_tuple_data = tuple_to_json(update.new_tuple(), column_names.as_deref());
             
             // Extract old tuple data if available
-            let old_tuple_data = update.old_tuple().map(|old_tuple| tuple_to_json(old_tuple, None));
+            let old_tuple_data = update.old_tuple()
+                .map(|old_tuple| tuple_to_json(old_tuple, column_names.as_deref()));
             
             Ok(processor::ChangeRecord {
                 timestamp,
@@ -138,8 +214,9 @@ pub fn extract_record_data(
             })
         }
         LogicalReplicationMessage::Delete(delete) => {
-            // Extract tuple data
-            let old_tuple_data = delete.old_tuple().map(|tuple| tuple_to_json(tuple, None));
+            // Extract tuple data with column names
+            let old_tuple_data = delete.old_tuple()
+                .map(|tuple| tuple_to_json(tuple, column_names.as_deref()));
             
             Ok(processor::ChangeRecord {
                 timestamp,

@@ -1,4 +1,5 @@
 Goal is to build end to working app in rust which reads cdc logs from postgres, creates batch based on time or size and uploads to s3 in parquet format with zstd level 3 compression.
+DO NOT USE DEBUG REPR TO SERIALISE THE postgres cdc changes 
 
 - Design from first principles
 - Follow SOLID principles
