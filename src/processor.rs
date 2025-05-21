@@ -19,7 +19,7 @@ use postgres_replication::protocol::LogicalReplicationMessage;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::fs::File;
+// Removed unused File import
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::interval;
 use tokio_stream::wrappers::IntervalStream;
@@ -264,8 +264,8 @@ impl ChangeProcessor {
         Ok(())
     }
     
-    /// Upload a file to S3/MinIO
-    async fn upload_to_s3(&self, file_path: &Path) -> Result<Option<String>> {
+    /// Direct streaming upload of data to S3/MinIO
+    async fn upload_to_s3_direct(&self, data: Vec<u8>, filename: &str) -> Result<Option<String>> {
         // Check if S3 is configured
         let s3_config = match &self.config.s3_config {
             Some(config) => config,
@@ -282,11 +282,6 @@ impl ChangeProcessor {
             }
         };
         
-        // Get filename from path
-        let filename = file_path.file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
-        
         // Create S3 key with optional prefix
         let key = if let Some(prefix) = &s3_config.prefix {
             format!("{}/{}", prefix.trim_end_matches('/'), filename)
@@ -294,14 +289,10 @@ impl ChangeProcessor {
             filename.to_string()
         };
         
-        debug!("Uploading file {} to S3 bucket {} with key {}", file_path.display(), s3_config.bucket, key);
+        debug!("Directly uploading {} bytes to S3 bucket {} with key {}", data.len(), s3_config.bucket, key);
         
-        // Read file content
-        let content = tokio::fs::read(file_path).await
-            .context(format!("Failed to read file {}", file_path.display()))?;
-        
-        // Create byte stream from content
-        let body = ByteStream::new(content.into());
+        // Create byte stream directly from the in-memory data
+        let body = ByteStream::new(data.into());
         
         // Upload to S3
         info!("Uploading to bucket: '{}' with key: '{}'", s3_config.bucket, key);
@@ -313,10 +304,10 @@ impl ChangeProcessor {
             
         match put_object_request.send().await {
             Ok(_) => {
-                info!("Successfully uploaded file to S3: s3://{}/{}", s3_config.bucket, key);
+                info!("Successfully uploaded data to S3: s3://{}/{}", s3_config.bucket, key);
             },
             Err(e) => {
-                return Err(anyhow::anyhow!("Failed to upload file to S3: {}", e));
+                return Err(anyhow::anyhow!("Failed to upload data to S3: {}", e));
             }
         };
         
@@ -444,41 +435,14 @@ impl ChangeProcessor {
         Ok(batch)
     }
     
-    /// Write a batch of records to a Parquet file
+    /// Write a batch of records to Parquet format and directly upload to S3
     async fn write_batch_to_parquet(&self, records: &[ChangeRecord]) -> Result<u64> {
         if records.is_empty() {
             return Ok(0);
         }
         
-        // Make sure we're using absolute paths for the output directory
-        let absolute_output_dir = if Path::new(&self.config.output_dir).is_absolute() {
-            self.config.output_dir.clone()
-        } else {
-            // Get the current directory and join it with the relative path
-            let current_dir = std::env::current_dir()
-                .context("Failed to get current directory")?;
-            current_dir.join(&self.config.output_dir)
-                .to_string_lossy()
-                .to_string()
-        };
-        
-        // Create the output directory if it doesn't exist
-        tokio::fs::create_dir_all(&absolute_output_dir).await?;
-        
-        // Generate a new filename if needed
-        let filename = {
-            let mut current_file = self.state.current_file.lock().await;
-            if current_file.is_none() || self.state.current_file_size.load(Ordering::Relaxed) >= self.config.max_file_size {
-                let new_filename = self.generate_filename();
-                *current_file = Some(new_filename);
-                self.state.current_file_size.store(0, Ordering::Relaxed);
-            }
-            current_file.clone().unwrap()
-        };
-        
-        // Create an absolute path for the output file
-        let output_path = Path::new(&absolute_output_dir).join(&filename);
-        debug!("Writing to output path: {}", output_path.display());
+        // Generate filename
+        let filename = self.generate_filename();
         
         // Convert records to Arrow format
         let record_batch = self.records_to_arrow_batch(records)
@@ -489,38 +453,43 @@ impl ChangeProcessor {
             .set_compression(parquet::basic::Compression::ZSTD(parquet::basic::ZstdLevel::try_new(3).unwrap_or_default()))
             .build();
         
-        // Create the output file directly - no temporary file dance needed
-        let file = File::create(&output_path).await?;
-        let file = file.into_std().await;
+        // Create an in-memory buffer to hold the Parquet data
+        let cursor = std::io::Cursor::new(Vec::new());
         
         // Create the Arrow Parquet writer with ZSTD compression
-        let mut writer = ArrowWriter::try_new(file, record_batch.schema(), Some(props))?;
+        let mut writer = match ArrowWriter::try_new(cursor, record_batch.schema(), Some(props)) {
+            Ok(writer) => writer,
+            Err(e) => return Err(anyhow::anyhow!("Failed to create Arrow writer: {}", e)),
+        };
         
-        // Write the batch to the Parquet file
-        writer.write(&record_batch)?;
+        // Write the batch to the in-memory buffer
+        if let Err(e) = writer.write(&record_batch) {
+            return Err(anyhow::anyhow!("Failed to write records to Parquet format: {}", e));
+        }
         
-        // Ensure the writer is properly closed, which writes the Parquet footer
-        writer.close()?;
+        // Important: into_inner() must be called before close() since close() takes ownership
+        // Get the inner cursor from the writer
+        let cursor = match writer.into_inner() {
+            Ok(c) => c,
+            Err(e) => return Err(anyhow::anyhow!("Failed to extract Parquet data: {}", e)),
+        };
+            
+        // Get the Vec<u8> from the cursor
+        let parquet_data = cursor.into_inner();
         
-        // Get file size
-        let metadata = tokio::fs::metadata(&output_path).await?;
-        let file_size = metadata.len();
+        // Measure the data size
+        let file_size = parquet_data.len() as u64;
         
-        // Update current file size
+        // Update current file size metrics
         self.state.current_file_size.fetch_add(file_size, Ordering::Relaxed);
         
-        info!(
-            "Wrote {} records to Parquet file {}, size: {} bytes", 
-            records.len(), 
-            output_path.display(),
-            file_size
-        );
+        info!("Serialized {} records to Parquet format, size: {} bytes", records.len(), file_size);
         
-        // Upload to MinIO/S3 if configured
+        // If S3 is configured, upload directly from memory
         if self.config.s3_config.is_some() {
-            match self.upload_to_s3(&output_path).await {
+            match self.upload_to_s3_direct(parquet_data, &filename).await {
                 Ok(Some(s3_uri)) => {
-                    info!("Uploaded parquet file to {}", s3_uri);
+                    info!("Directly uploaded Parquet data to {}", s3_uri);
                 }
                 Ok(None) => {
                     debug!("S3 upload not configured or skipped");
@@ -530,6 +499,31 @@ impl ChangeProcessor {
                     info!("Failed to upload to S3: {}", e);
                 }
             }
+        } else {
+            // If S3 is not configured, we need to write to local storage
+            // This is the only place where we write to disk
+            let absolute_output_dir = if Path::new(&self.config.output_dir).is_absolute() {
+                self.config.output_dir.clone()
+            } else {
+                // Get the current directory and join it with the relative path
+                std::env::current_dir()
+                    .context("Failed to get current directory")?
+                    .join(&self.config.output_dir)
+                    .to_string_lossy()
+                    .to_string()
+            };
+            
+            // Create the output directory if it doesn't exist
+            tokio::fs::create_dir_all(&absolute_output_dir).await?;
+            
+            // Create an absolute path for the output file
+            let output_path = Path::new(&absolute_output_dir).join(&filename);
+            
+            // Write the Parquet data to the local file
+            tokio::fs::write(&output_path, &parquet_data).await
+                .context(format!("Failed to write local file: {}", output_path.display()))?;
+                
+            info!("Wrote {} records to local Parquet file: {}", records.len(), output_path.display());
         }
         
         Ok(file_size)
@@ -633,6 +627,14 @@ impl ChangeProcessor {
         };
         
         let backoff = ExponentialBackoff::default();
-        backoff::future::retry(backoff, operation).await
+        let result = backoff::future::retry(backoff, operation).await;
+        
+        // Log the result but return the result as required
+        match &result {
+            Ok(_) => info!("Successfully flushed batch after retries"),
+            Err(e) => error!(error=?e, "Failed to flush batch after multiple retries")
+        }
+        
+        result
     }
 }

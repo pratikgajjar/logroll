@@ -1,24 +1,15 @@
 Goal is to build end to working app in rust which reads cdc logs from postgres, creates batch based on time or size and uploads to s3 in parquet format with zstd level 3 compression.
-DO NOT USE DEBUG REPR TO SERIALISE THE postgres cdc changes 
 
 - Design from first principles
 - Follow SOLID principles
 - Divide into modular components to manage complexity
-- Create small Rust modules to avoid reaching output context limits
 - Optimize for blazing fast performance
 - Build resilience to failures
 - Handle graceful shutdowns
 - Frequently verify compilation with `cargo check`
 - Structure code to enable graceful error handling
-- Use latest stable Rust and Cargo
-- Use Tokio for async runtime
 - Use postgres_replication for replication logic
 - Configure pgoutput as the replication plugin
-- Instrument code with comprehensive metrics
-- Implement structured logging throughout
-- Use logfmt format for logging (key=value pairs)
-- Include appropriate log levels for different scenarios
+- Implement structured logging throughout, use info, debug, error, warn
 - Compile frequently to catch errors early
-- Maintain modular structure as project complexity increases
-- Make intentional architectural decisions
 - Do not update README.md unless explicitly requested

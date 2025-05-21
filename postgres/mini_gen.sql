@@ -23,7 +23,7 @@ WITH batch_insert AS (
          FROM generate_series(1, (random() * 10 + 1)::INT)) AS integer_array,
         NOW() - (n * INTERVAL '1 hour') AS created_at,
         NOW() - (n * INTERVAL '30 minute') AS updated_at
-    FROM generate_series(1, 20) AS n  -- Generate 20 rows by default
+    FROM generate_series(1, 5) AS n  -- Generate 20 rows by default
 )
 INSERT INTO mini_postgres_data_types (
     name, 
@@ -109,3 +109,10 @@ INSERT INTO mini_postgres_data_types (
      '{"active": true, "count": 0, "data": null}',
      ARRAY[-1, 0, 1]
     );
+
+UPDATE mini_postgres_data_types 
+    SET 
+        integer_val = integer_val + 1000, 
+        timestamp_val = timestamp_val - INTERVAL '10 days';
+
+DELETE from mini_postgres_data_types where 1 = 1 ; 

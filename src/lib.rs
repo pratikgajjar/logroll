@@ -117,58 +117,7 @@ fn parse_text_value(text: &str) -> JsonValue {
     JsonValue::String(text.to_string())
 }
 
-// Parse PostgreSQL array values into a JSON array
-fn parse_pg_array(text: &str) -> JsonValue {
-    if !text.starts_with('{') || !text.ends_with('}') {
-        return JsonValue::String(text.to_string());
-    }
-    
-    // Extract the content between { }
-    let content = &text[1..text.len()-1];
-    if content.is_empty() {
-        return JsonValue::Array(Vec::new());
-    }
-    
-    // Split the array elements, handling nested structures
-    let mut result = Vec::new();
-    let mut current = String::new();
-    let mut nesting = 0;
-    let mut in_quotes = false;
-    
-    for c in content.chars() {
-        match c {
-            '"' => {
-                in_quotes = !in_quotes;
-                current.push(c);
-            },
-            '{' | '[' if !in_quotes => {
-                nesting += 1;
-                current.push(c);
-            },
-            '}' | ']' if !in_quotes => {
-                nesting -= 1;
-                current.push(c);
-            },
-            ',' if !in_quotes && nesting == 0 => {
-                // End of element
-                let element = current.trim();
-                if !element.is_empty() {
-                    result.push(parse_text_value(element));
-                }
-                current.clear();
-            },
-            _ => current.push(c),
-        }
-    }
-    
-    // Add the last element
-    let last = current.trim();
-    if !last.is_empty() {
-        result.push(parse_text_value(last));
-    }
-    
-    JsonValue::Array(result)
-}
+// Note: Array parsing is now handled directly within parse_text_value when needed
 
 /// Extract data from a replication message
 pub fn extract_record_data(
