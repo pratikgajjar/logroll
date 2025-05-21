@@ -37,6 +37,14 @@ metrics-exporter-prometheus = "0.17.0"
 anyhow = "1.0.98"
 thiserror = "2.0.12"
 
+# AWS S3 SDK for MinIO integration
+aws-config = "1.6.3"
+aws-credential-types = "1.2.3"
+aws-sdk-s3 = "1.87.0"
+aws-smithy-client = "0.60.3"
+aws-smithy-http = "0.62.1"
+aws-types = "1.3.7"
+
 # Configuration and utilities
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
@@ -46,15 +54,15 @@ ctrlc = "3.4.6"
 backoff = { version = "0.4.0", features = ["tokio"] }
 chrono = { version = "0.4.41", features = ["serde"] }
 once_cell = "1.21.3"
-prometheus = "0.13"
+prometheus = "0.14.0"
 md5 = "0.7.0"
 futures-util = "0.3.31"
-parquet = { version = "55.1.0", features = ["async"] }
+parquet = { version = "55.1.0", features = ["async", "zstd"] }
 arrow = "55.0.0"
 tokio-stream = "0.1.14"
 uuid = { version = "1.7.0", features = ["v4", "serde"] }
 tempfile = "3.10.1"
-base64 = "0.21.7"
+base64 = "0.22.1"
 
 [dev-dependencies]
 tokio = { version = "1.44.2", features = ["full", "test-util"] }
