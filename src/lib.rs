@@ -136,7 +136,7 @@ pub fn extract_record_data(
             
             Ok(processor::ChangeRecord {
                 timestamp,
-                lsn: lsn.to_string(),
+                lsn: u64::from(lsn),
                 table: table_name,
                 op: "INSERT".to_string(),
                 before: None,
@@ -154,7 +154,7 @@ pub fn extract_record_data(
             
             Ok(processor::ChangeRecord {
                 timestamp,
-                lsn: lsn.to_string(),
+                lsn: u64::from(lsn),
                 table: table_name,
                 op: "UPDATE".to_string(),
                 before: old_tuple_data,
@@ -163,13 +163,63 @@ pub fn extract_record_data(
             })
         }
         LogicalReplicationMessage::Delete(delete) => {
-            // Extract tuple data with column names
-            let old_tuple_data = delete.old_tuple()
-                .map(|tuple| tuple_to_json(tuple, column_names.as_deref()));
+            // First try to extract complete tuple data if available (REPLICA IDENTITY FULL)
+            let old_tuple_data = if let Some(tuple) = delete.old_tuple() {
+                // We have the complete old tuple
+                Some(tuple_to_json(tuple, column_names.as_deref()))
+            } else {
+                // Handle REPLICA IDENTITY DEFAULT/KEYS/NOTHING
+                // For 'keys only', we need to extract the key fields manually
+                let key_fields = delete.key_tuple();
+                
+                if let Some(key_tuple) = key_fields {
+                    // We have key fields only, which typically contains just the primary key
+                    // This happens when replica identity is set to 'keys'
+                    
+                    // Extract the raw key tuple data to create a compact representation with only primary keys
+                    let tuple_data = key_tuple.tuple_data();
+                    let mut map = serde_json::Map::new();
+                    
+                    // Process each key column's data, skipping nulls
+                    for (i, data) in tuple_data.iter().enumerate() {
+                        // Skip null values entirely to save space
+                        if let postgres_replication::protocol::TupleData::Text(bytes) = data {
+                            // Only process non-empty text values
+                            if !bytes.is_empty() {
+                                // Determine column name
+                                let column_name = if let Some(names) = column_names.as_deref() {
+                                    if i < names.len() {
+                                        names[i].clone()
+                                    } else {
+                                        format!("col_{}", i)
+                                    }
+                                } else {
+                                    format!("col_{}", i)
+                                };
+                                
+                                // Parse value while preserving data type
+                                let text = String::from_utf8_lossy(bytes);
+                                let json_value = parse_text_value(&text);
+                                
+                                // Only add non-null values
+                                if !json_value.is_null() {
+                                    map.insert(column_name, json_value);
+                                }
+                            }
+                        }
+                    }
+                    
+                    Some(JsonValue::Object(map))
+                } else {
+                    // No identity information available at all (REPLICA IDENTITY NOTHING)
+                    tracing::warn!("No tuple data available for DELETE operation on table {}", table_name);
+                    None
+                }
+            };
             
             Ok(processor::ChangeRecord {
                 timestamp,
-                lsn: lsn.to_string(),
+                lsn: u64::from(lsn),
                 table: table_name,
                 op: "DELETE".to_string(),
                 before: old_tuple_data,
@@ -186,7 +236,7 @@ pub fn extract_record_data(
             
             Ok(processor::ChangeRecord {
                 timestamp,
-                lsn: lsn.to_string(),
+                lsn: u64::from(lsn),
                 table: table_name,
                 op: "TRUNCATE".to_string(),
                 before: None,

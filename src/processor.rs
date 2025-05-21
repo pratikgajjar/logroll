@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arrow::array::{StringArray, TimestampMicrosecondArray};
+use arrow::array::{StringArray, TimestampMicrosecondArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use aws_config::meta::region::RegionProviderChain;
@@ -25,6 +25,7 @@ use tokio::time::interval;
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{debug, info, warn, error};
 use uuid::Uuid;
+use std::num::ParseIntError;
 use std::sync::Arc;
 
 /// Configuration for the data processor
@@ -91,8 +92,9 @@ pub struct ChangeRecord {
     #[serde(with = "chrono::serde::ts_microseconds")]
     pub timestamp: DateTime<Utc>,
     
-    /// Log Sequence Number of the change
-    pub lsn: String,
+    /// Log Sequence Number of the change as a u64
+    /// This is the native representation in PostgreSQL
+    pub lsn: u64,
     
     /// Table name
     pub table: String,
@@ -137,6 +139,8 @@ struct ProcessorState {
     /// S3 client for MinIO operations
     s3_client: Mutex<Option<S3Client>>,
 }
+
+
 
 impl ChangeProcessor {
     /// Create a new change processor
@@ -195,14 +199,33 @@ impl ChangeProcessor {
         map.get(&id).map(|(table_name, _)| table_name.clone())
     }
     
-    /// Generate a new output filename
-    fn generate_filename(&self) -> String {
-        let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-        let uuid = Uuid::new_v4();
+    /// Generate a new output filename using date-based hierarchical format with LSN
+    /// Uses timestamp from the records rather than current time
+    fn generate_filename(&self, records: &[ChangeRecord]) -> String {
+        if records.is_empty() {
+            // Fallback if no records - this should rarely happen
+            let now = chrono::Utc::now();
+            return format!("{}/{}/{}/initial.parquet", 
+                now.format("%Y"), 
+                now.format("%m"), 
+                now.format("%d")
+            );
+        }
         
-        self.config.file_name_pattern
-            .replace("{timestamp}", &timestamp.to_string())
-            .replace("{uuid}", &uuid.to_string())
+        // Get the last record in the batch for timestamp and LSN
+        let last_record = records.last().unwrap(); // Safe because we checked is_empty
+        
+        // Extract date components from the record's timestamp
+        // This ensures partitioning based on when the change actually occurred in the database
+        let year = last_record.timestamp.format("%Y");
+        let month = last_record.timestamp.format("%m");
+        let day = last_record.timestamp.format("%d");
+        
+        // Use the LSN directly from the record (already a u64)
+        let lsn = last_record.lsn;
+        
+        // Format: YYYY/MM/DD/{LSN}.parquet
+        format!("{}/{}/{}/{}.parquet", year, month, day, lsn)
     }
     
     /// Initialize the S3 client for MinIO
@@ -363,8 +386,8 @@ impl ChangeProcessor {
             .map(|r| r.timestamp.timestamp_micros())
             .collect();
         
-        let lsns: Vec<String> = records.iter()
-            .map(|r| r.lsn.clone())
+        let lsns: Vec<u64> = records.iter()
+            .map(|r| r.lsn)
             .collect();
         
         let tables: Vec<String> = records.iter()
@@ -401,7 +424,7 @@ impl ChangeProcessor {
         // Create Arrow schema
         let schema = ArrowSchema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
-            Field::new("lsn", DataType::Utf8, false),
+            Field::new("lsn", DataType::UInt64, false),
             Field::new("table", DataType::Utf8, false),
             Field::new("op", DataType::Utf8, false),
             Field::new("before", DataType::Utf8, true),
@@ -411,7 +434,7 @@ impl ChangeProcessor {
     
         // Create arrays
         let timestamp_array = TimestampMicrosecondArray::from(timestamps);
-        let lsn_array = StringArray::from(lsns);
+        let lsn_array = UInt64Array::from(lsns);
         let table_array = StringArray::from(tables);
         let op_array = StringArray::from(ops);
         let before_array = StringArray::from(before_jsons);
@@ -441,8 +464,8 @@ impl ChangeProcessor {
             return Ok(0);
         }
         
-        // Generate filename
-        let filename = self.generate_filename();
+        // Generate filename with the hierarchical date structure and LSN from last event
+        let filename = self.generate_filename(records);
         
         // Convert records to Arrow format
         let record_batch = self.records_to_arrow_batch(records)
@@ -486,22 +509,24 @@ impl ChangeProcessor {
         info!("Serialized {} records to Parquet format, size: {} bytes", records.len(), file_size);
         
         // If S3 is configured, upload directly from memory
-        if self.config.s3_config.is_some() {
+        if let Some(s3_config) = &self.config.s3_config {
+            // S3 is configured - upload directly and propagate any errors
             match self.upload_to_s3_direct(parquet_data, &filename).await {
                 Ok(Some(s3_uri)) => {
                     info!("Directly uploaded Parquet data to {}", s3_uri);
-                }
+                },
                 Ok(None) => {
-                    debug!("S3 upload not configured or skipped");
-                }
+                    // This shouldn't happen if S3 is properly configured
+                    return Err(anyhow::anyhow!("S3 upload returned None when S3 was configured"));
+                },
                 Err(e) => {
-                    // Log error but don't fail the operation
-                    info!("Failed to upload to S3: {}", e);
+                    // Propagate the error upward - never try to write locally as a fallback
+                    return Err(anyhow::anyhow!("S3 upload failed to bucket '{}' with key '{}': {}", 
+                                               s3_config.bucket, filename, e));
                 }
             }
         } else {
-            // If S3 is not configured, we need to write to local storage
-            // This is the only place where we write to disk
+            // Only allow local storage if S3 is explicitly not configured
             let absolute_output_dir = if Path::new(&self.config.output_dir).is_absolute() {
                 self.config.output_dir.clone()
             } else {
@@ -514,12 +539,13 @@ impl ChangeProcessor {
             };
             
             // Create the output directory if it doesn't exist
-            tokio::fs::create_dir_all(&absolute_output_dir).await?;
+            tokio::fs::create_dir_all(&absolute_output_dir).await
+                .context(format!("Failed to create output directory: {}", absolute_output_dir))?;
             
             // Create an absolute path for the output file
             let output_path = Path::new(&absolute_output_dir).join(&filename);
             
-            // Write the Parquet data to the local file
+            // Write the Parquet data to the local file - propagate any errors
             tokio::fs::write(&output_path, &parquet_data).await
                 .context(format!("Failed to write local file: {}", output_path.display()))?;
                 
@@ -570,8 +596,11 @@ impl ChangeProcessor {
                                     // Use structured error logging
                                     error!(error=?e, batch_size=batch_size, "Failed to flush batch");
                                     
-                                    // Implement exponential backoff retry
-                                    processor.retry_flush_with_backoff().await;
+                                    // Try with backoff, but abort processing if all retries fail
+                                    if let Err(retry_err) = processor.retry_flush_with_backoff().await {
+                                        error!(error=?retry_err, "Failed all retry attempts, stopping processor");
+                                        break;
+                                    }
                                 }
                             }
                             last_flush_time = std::time::Instant::now();
@@ -613,23 +642,38 @@ impl ChangeProcessor {
     }
     
     /// Retry flushing the batch with exponential backoff
+    /// If all retries fail, returns the error to the caller
     async fn retry_flush_with_backoff(&self) -> Result<()> {
         use backoff::{ExponentialBackoff, Error as BackoffError};
+        
+        // Create a more aggressive backoff strategy with fewer retries
+        // We don't want to keep retrying indefinitely for S3 failures
+        let mut backoff = ExponentialBackoff {
+            max_elapsed_time: Some(std::time::Duration::from_secs(30)),  // Only retry for 30 seconds max
+            max_interval: std::time::Duration::from_secs(5),           // Cap max delay at 5 seconds
+            multiplier: 2.0,                                           // Double delay each time
+            ..ExponentialBackoff::default()
+        };
         
         let operation = || async {
             match self.flush_batch().await {
                 Ok(_) => Ok(()),
                 Err(e) => {
+                    // If this is an S3 error, we should fail fast
+                    if e.to_string().contains("S3 upload failed") {
+                        error!(error=?e, "S3 upload error detected, failing immediately");
+                        return Err(BackoffError::permanent(e));
+                    }
+                    
+                    // For other errors, allow limited retries
                     error!(error=?e, "Retry attempt failed");
                     Err(BackoffError::transient(e))
                 }
             }
         };
         
-        let backoff = ExponentialBackoff::default();
         let result = backoff::future::retry(backoff, operation).await;
         
-        // Log the result but return the result as required
         match &result {
             Ok(_) => info!("Successfully flushed batch after retries"),
             Err(e) => error!(error=?e, "Failed to flush batch after multiple retries")
