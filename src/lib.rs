@@ -20,7 +20,7 @@ pub use postgres_types::PgLsn;
 pub use tokio_postgres::{config::ReplicationMode, Client, Config, NoTls};
 
 // Re-export our processor types
-pub use processor::{ChangeProcessor, ChangeRecord, ProcessorConfig};
+pub use processor::{ChangeProcessor, ChangeRecord, ProcessorConfig, S3Config};
 pub use std::collections::HashMap;
 
 use anyhow::Result;
@@ -101,7 +101,7 @@ pub fn extract_record_data(
     message: &LogicalReplicationMessage,
     lsn: PgLsn,
     table_name: String,
-    relation_id: Option<u32>,
+    _relation_id: Option<u32>,
 ) -> Result<processor::ChangeRecord> {
     let timestamp = Utc::now();
     

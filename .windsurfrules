@@ -1,3 +1,5 @@
+Goal is to build end to working app in rust which reads cdc logs from postgres, creates batch based on time or size and uploads to s3 in parquet format with zstd level 3 compression.
+
 - Design from first principles
 - Follow SOLID principles
 - Divide into modular components to manage complexity

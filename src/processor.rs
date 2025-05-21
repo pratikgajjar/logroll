@@ -7,6 +7,10 @@ use anyhow::{Context, Result};
 use arrow::array::{StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use aws_config::meta::region::RegionProviderChain;
+use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client as S3Client;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -19,7 +23,7 @@ use tokio::fs::File;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::interval;
 use tokio_stream::wrappers::IntervalStream;
-use tracing::{debug, error, info};
+use tracing::{debug, info, warn, error};
 use uuid::Uuid;
 use std::sync::Arc;
 
@@ -40,16 +44,42 @@ pub struct ProcessorConfig {
     
     /// Pattern for output filenames
     pub file_name_pattern: String,
+    
+    /// S3 configuration for MinIO storage
+    pub s3_config: Option<S3Config>,
+}
+
+/// Configuration for S3/MinIO integration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3Config {
+    /// MinIO/S3 endpoint URL
+    pub endpoint: String,
+    
+    /// S3 bucket name
+    pub bucket: String,
+    
+    /// Access key for authentication
+    pub access_key: String,
+    
+    /// Secret key for authentication
+    pub secret_key: String,
+    
+    /// Region (optional, defaults to "us-east-1")
+    pub region: Option<String>,
+    
+    /// Path prefix for S3 objects
+    pub prefix: Option<String>,
 }
 
 impl Default for ProcessorConfig {
     fn default() -> Self {
         Self {
             output_dir: "data".to_string(),
-            max_batch_size: 10000,
-            flush_interval_ms: 5000,
+            max_batch_size: 1000, // Updated to 1000 rows as requested
+            flush_interval_ms: 5000, // 5s timer
             max_file_size: 100 * 1024 * 1024, // 100MB default
             file_name_pattern: "logroll_changes_{timestamp}_{uuid}.parquet".to_string(),
+            s3_config: None,
         }
     }
 }
@@ -103,20 +133,37 @@ struct ProcessorState {
     
     /// Current batch of records
     batch: Mutex<Vec<ChangeRecord>>,
+    
+    /// S3 client for MinIO operations
+    s3_client: Mutex<Option<S3Client>>,
 }
 
 impl ChangeProcessor {
     /// Create a new change processor
     pub fn new(config: ProcessorConfig) -> Self {
-        Self {
-            config,
+        let processor = Self {
+            config: config.clone(),
             state: Arc::new(ProcessorState {
                 relation_map: Mutex::new(HashMap::new()),
                 current_file_size: AtomicU64::new(0),
                 current_file: Mutex::new(None),
                 batch: Mutex::new(Vec::with_capacity(1000)),
+                s3_client: Mutex::new(None),
             }),
+        };
+        
+        // Initialize S3 client if S3 config is provided
+        if let Some(s3_config) = &config.s3_config {
+            let processor_clone = processor.clone();
+            let s3_config_clone = s3_config.clone();
+            tokio::spawn(async move {
+                if let Err(e) = processor_clone.initialize_s3_client(s3_config_clone).await {
+                    tracing::error!("Failed to initialize S3 client: {}", e);
+                }
+            });
         }
+        
+        processor
     }
     
     /// Register a relation (table) with its ID and extract table name and column names
@@ -156,6 +203,134 @@ impl ChangeProcessor {
         self.config.file_name_pattern
             .replace("{timestamp}", &timestamp.to_string())
             .replace("{uuid}", &uuid.to_string())
+    }
+    
+    /// Initialize the S3 client for MinIO
+    async fn initialize_s3_client(&self, s3_config: S3Config) -> Result<()> {
+        info!("Initializing S3 client for MinIO at {}", s3_config.endpoint);
+        
+        // Create credentials provider for the static credentials
+        let credentials_provider = SharedCredentialsProvider::new(
+            aws_credential_types::Credentials::new(
+                s3_config.access_key.clone(),
+                s3_config.secret_key.clone(),
+                None, // session token
+                None, // expiry
+                "logroll-minio-provider",
+            )
+        );
+        
+        // Determine region
+        let region_str = s3_config.region.unwrap_or_else(|| "us-east-1".to_string());
+        let region_provider = RegionProviderChain::first_try(aws_sdk_s3::config::Region::new(region_str));
+        
+        // Configure S3 client
+        let endpoint_url = s3_config.endpoint.clone();
+        let s3_config_aws = aws_sdk_s3::config::Builder::new()
+            .region(region_provider.region().await)
+            .credentials_provider(credentials_provider)
+            .endpoint_url(endpoint_url)
+            .force_path_style(true) // Required for MinIO
+            .behavior_version_latest() // Required for AWS SDK 1.87.0+
+            .build();
+        
+        // Create S3 client
+        let client = S3Client::from_conf(s3_config_aws.clone());
+        
+        // Store client in shared state
+        let mut s3_client_guard = self.state.s3_client.lock().await;
+        *s3_client_guard = Some(client.clone());
+        
+        // Check if bucket exists, create it if it doesn't
+        let bucket_name = s3_config.bucket.clone();
+        match client.head_bucket().bucket(&bucket_name).send().await {
+            Ok(_) => {
+                info!("Bucket '{}' exists", bucket_name);
+            },
+            Err(_) => {
+                info!("Bucket '{}' does not exist, creating it", bucket_name);
+                // Create the bucket
+                match client.create_bucket().bucket(&bucket_name).send().await {
+                    Ok(_) => info!("Successfully created bucket: {}", bucket_name),
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to create S3 bucket: {}", e));
+                    }
+                }
+            }
+        }
+        
+        info!("S3 client for MinIO initialized successfully");
+        
+        Ok(())
+    }
+    
+    /// Upload a file to S3/MinIO
+    async fn upload_to_s3(&self, file_path: &Path) -> Result<Option<String>> {
+        // Check if S3 is configured
+        let s3_config = match &self.config.s3_config {
+            Some(config) => config,
+            None => return Ok(None),
+        };
+        
+        // Get S3 client
+        let s3_client_guard = self.state.s3_client.lock().await;
+        let client = match &*s3_client_guard {
+            Some(client) => client,
+            None => {
+                info!("S3 client not initialized, skipping upload");
+                return Ok(None);
+            }
+        };
+        
+        // Get filename from path
+        let filename = file_path.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
+        
+        // Create S3 key with optional prefix
+        let key = if let Some(prefix) = &s3_config.prefix {
+            format!("{}/{}", prefix.trim_end_matches('/'), filename)
+        } else {
+            filename.to_string()
+        };
+        
+        debug!("Uploading file {} to S3 bucket {} with key {}", file_path.display(), s3_config.bucket, key);
+        
+        // Read file content
+        let content = tokio::fs::read(file_path).await
+            .context(format!("Failed to read file {}", file_path.display()))?;
+        
+        // Create byte stream from content
+        let body = ByteStream::new(content.into());
+        
+        // Upload to S3
+        info!("Uploading to bucket: '{}' with key: '{}'", s3_config.bucket, key);
+        let put_object_request = client.put_object()
+            .bucket(&s3_config.bucket)
+            .key(&key)
+            .body(body)
+            .content_type("application/octet-stream");
+            
+        match put_object_request.send().await {
+            Ok(_) => {
+                info!("Successfully uploaded file to S3: s3://{}/{}", s3_config.bucket, key);
+            },
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to upload file to S3: {}", e));
+            }
+        };
+        
+        // Verify the upload with a head request
+        match client.head_object()
+            .bucket(&s3_config.bucket)
+            .key(&key)
+            .send()
+            .await {
+            Ok(_) => info!("Verified object exists in S3"),
+            Err(e) => warn!("Object verification failed: {}", e)
+        }
+        
+        Ok(Some(format!("s3://{}/{}", s3_config.bucket, key)))
     }
     
     /// Add a record to the batch
@@ -275,8 +450,20 @@ impl ChangeProcessor {
             return Ok(0);
         }
         
+        // Make sure we're using absolute paths for the output directory
+        let absolute_output_dir = if Path::new(&self.config.output_dir).is_absolute() {
+            self.config.output_dir.clone()
+        } else {
+            // Get the current directory and join it with the relative path
+            let current_dir = std::env::current_dir()
+                .context("Failed to get current directory")?;
+            current_dir.join(&self.config.output_dir)
+                .to_string_lossy()
+                .to_string()
+        };
+        
         // Create the output directory if it doesn't exist
-        tokio::fs::create_dir_all(&self.config.output_dir).await?;
+        tokio::fs::create_dir_all(&absolute_output_dir).await?;
         
         // Generate a new filename if needed
         let filename = {
@@ -289,15 +476,17 @@ impl ChangeProcessor {
             current_file.clone().unwrap()
         };
         
-        let output_path = Path::new(&self.config.output_dir).join(&filename);
+        // Create an absolute path for the output file
+        let output_path = Path::new(&absolute_output_dir).join(&filename);
+        debug!("Writing to output path: {}", output_path.display());
         
         // Convert records to Arrow format
         let record_batch = self.records_to_arrow_batch(records)
             .context("Failed to convert records to Arrow format")?;
         
-        // Set up writer properties
+        // Set up writer properties with zstd level 3 compression
         let props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::SNAPPY)
+            .set_compression(parquet::basic::Compression::ZSTD(parquet::basic::ZstdLevel::try_new(3).unwrap_or_default()))
             .build();
         
         // Create a temporary file first
@@ -331,52 +520,123 @@ impl ChangeProcessor {
             file_size
         );
         
+        // Upload to MinIO/S3 if configured
+        if self.config.s3_config.is_some() {
+            match self.upload_to_s3(&output_path).await {
+                Ok(Some(s3_uri)) => {
+                    info!("Uploaded parquet file to {}", s3_uri);
+                }
+                Ok(None) => {
+                    debug!("S3 upload not configured or skipped");
+                }
+                Err(e) => {
+                    // Log error but don't fail the operation
+                    info!("Failed to upload to S3: {}", e);
+                }
+            }
+        }
+        
         Ok(file_size)
     }
     
     /// Start a processor task that consumes from a channel
     pub async fn start_processing(self, mut rx: mpsc::Receiver<ChangeRecord>) -> Result<()> {
-        // Create flush interval timer
-        let flush_interval = Duration::from_millis(self.config.flush_interval_ms);
-        let interval_stream = IntervalStream::new(interval(flush_interval));
-        tokio::pin!(interval_stream);
+        let processor = self.clone();
         
-        info!(
-            "Starting change processor with max_batch_size={}, flush_interval={}ms", 
-            self.config.max_batch_size,
-            self.config.flush_interval_ms
-        );
-        
-        loop {
-            tokio::select! {
-                // Process incoming records
-                Some(record) = rx.recv() => {
-                    self.add_record(record).await?;
-                }
-                
-                // Flush on interval
-                _ = interval_stream.next() => {
-                    let batch_len = {
-                        let batch = self.state.batch.lock().await;
-                        batch.len()
-                    };
+        // Start the background task that processes records and flushes periodically
+        tokio::spawn(async move {
+            info!("Starting change processor with max_batch_size={}, flush_interval={}ms", 
+                 processor.config.max_batch_size, processor.config.flush_interval_ms);
+                 
+            // Set up flush timer
+            let interval_ms = processor.config.flush_interval_ms;
+            let mut timer = IntervalStream::new(interval(Duration::from_millis(interval_ms)));
+            
+            // Create metrics for batch sizes and processing latency
+            let mut last_flush_time = std::time::Instant::now();
+            let mut total_records_processed: u64 = 0;
+            
+            // Process records
+            loop {
+                tokio::select! {
+                    // Timer triggered, flush whatever we have
+                    Some(_) = timer.next() => {
+                        let batch_size = {
+                            let batch = processor.state.batch.lock().await;
+                            batch.len()
+                        };
+                        
+                        if batch_size > 0 {
+                            let elapsed = last_flush_time.elapsed();
+                            info!("Flushing batch of {} records due to timer ({}ms since last flush)", 
+                                batch_size, elapsed.as_millis());
+                                
+                            match processor.flush_batch().await {
+                                Ok(_) => {
+                                    total_records_processed += batch_size as u64;
+                                    info!("Total records processed: {}", total_records_processed);
+                                },
+                                Err(e) => {
+                                    // Use structured error logging
+                                    error!(error=?e, batch_size=batch_size, "Failed to flush batch");
+                                    
+                                    // Implement exponential backoff retry
+                                    processor.retry_flush_with_backoff().await;
+                                }
+                            }
+                            last_flush_time = std::time::Instant::now();
+                        }
+                    }
                     
-                    if batch_len > 0 {
-                        debug!("Flushing {} records due to interval timer", batch_len);
-                        self.flush_batch().await?;
+                    // Received a record from the channel
+                    Some(record) = rx.recv() => {
+                        match processor.add_record(record).await {
+                            Ok(flushed) => {
+                                if flushed {
+                                    // Batch was flushed because it reached max_batch_size
+                                    total_records_processed += processor.config.max_batch_size as u64;
+                                    info!("Flushed batch due to size limit. Total records processed: {}", 
+                                          total_records_processed);
+                                    last_flush_time = std::time::Instant::now();
+                                }
+                            },
+                            Err(e) => {
+                                error!(error=?e, "Error adding record to batch");
+                            }
+                        }
+                    }
+                    
+                    // Channel closed, we're done
+                    else => {
+                        info!("Channel closed, flushing final batch");
+                        if let Err(e) = processor.flush_batch().await {
+                            error!(error=?e, "Error flushing final batch");
+                        }
+                        info!("Completed processing with {} total records", total_records_processed);
+                        break;
                     }
                 }
-                
-                // Exit if sender is closed
-                else => {
-                    info!("Channel closed, flushing remaining records");
-                    self.flush_batch().await?;
-                    break;
+            }
+        });
+        
+        Ok(())
+    }
+    
+    /// Retry flushing the batch with exponential backoff
+    async fn retry_flush_with_backoff(&self) -> Result<()> {
+        use backoff::{ExponentialBackoff, Error as BackoffError};
+        
+        let operation = || async {
+            match self.flush_batch().await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    error!(error=?e, "Retry attempt failed");
+                    Err(BackoffError::transient(e))
                 }
             }
-        }
+        };
         
-        info!("Change processor stopped");
-        Ok(())
+        let backoff = ExponentialBackoff::default();
+        backoff::future::retry(backoff, operation).await
     }
 }

@@ -7,8 +7,67 @@ use tracing_subscriber::fmt::format::FmtSpan;
 
 use logroll_cdc::{
     ChangeProcessor, ChangeRecord, Config, LogicalReplicationMessage, LogicalReplicationStream, 
-    NoTls, PgLsn, ProcessorConfig, ReplicationMessage, ReplicationMode, extract_record_data,
+    NoTls, PgLsn, ProcessorConfig, ReplicationMessage, ReplicationMode, S3Config, extract_record_data,
 };
+
+/// Try to load S3/MinIO configuration from environment variables
+fn get_s3_config_from_env() -> Option<S3Config> {
+    // Check if MinIO/S3 integration is enabled
+    let enable_s3 = env::var("ENABLE_S3")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()
+        .unwrap_or(false);
+    
+    if !enable_s3 {
+        return None;
+    }
+    
+    // Required configuration
+    let endpoint = match env::var("S3_ENDPOINT") {
+        Ok(endpoint) => endpoint,
+        Err(_) => {
+            warn!("S3_ENDPOINT not set, disabling S3 integration");
+            return None;
+        }
+    };
+    
+    let bucket = match env::var("S3_BUCKET") {
+        Ok(bucket) => bucket,
+        Err(_) => {
+            warn!("S3_BUCKET not set, disabling S3 integration");
+            return None;
+        }
+    };
+    
+    let access_key = match env::var("S3_ACCESS_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            warn!("S3_ACCESS_KEY not set, disabling S3 integration");
+            return None;
+        }
+    };
+    
+    let secret_key = match env::var("S3_SECRET_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            warn!("S3_SECRET_KEY not set, disabling S3 integration");
+            return None;
+        }
+    };
+    
+    // Optional configuration
+    let region = env::var("S3_REGION").ok();
+    let prefix = env::var("S3_PREFIX").ok();
+    
+    Some(S3Config {
+        endpoint,
+        bucket,
+        access_key,
+        secret_key,
+        region,
+        prefix,
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,7 +113,15 @@ async fn main() -> Result<()> {
             .unwrap_or(104857600),
         file_name_pattern: env::var("FILE_NAME_PATTERN")
             .unwrap_or_else(|_| "logroll_changes_{timestamp}_{uuid}.parquet".to_string()),
+        s3_config: get_s3_config_from_env(),
     };
+    
+    // Log configuration info
+    if processor_config.s3_config.is_some() {
+        info!("MinIO/S3 integration enabled, files will be uploaded to bucket");
+    } else {
+        info!("MinIO/S3 integration disabled, files will only be saved locally");
+    }
     
     // Set up channel for change records
     let (tx, rx) = mpsc::channel::<ChangeRecord>(1000);
